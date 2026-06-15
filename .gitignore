@@ -1,0 +1,14 @@
+# Build directories
+/build/
+/out/
+
+# vcpkg local packages
+/vcpkg_installed/
+/pkg-config-lite/
+
+# IDE files
+/.vs/
+/.vscode/
+/*.user
+/CMakeSettings.json
+/CMakePresets.json

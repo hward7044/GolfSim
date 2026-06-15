@@ -1,0 +1,1 @@
+This folder is for custom header files (.h, .hpp) for the GolfSim project.
