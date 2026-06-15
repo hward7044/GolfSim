@@ -4,6 +4,35 @@
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 
+#include "IUsbVideoDriver.hpp"
+#include "V4L2Driver.hpp"
+#include "MediaFoundationDriver.hpp"
+#include "CameraRole.hpp"
+#include "FrameSet.hpp"
+#include "ICameraNode.hpp"
+#include "OV9281CameraNode.hpp"
+#include "PlaybackCameraNode.hpp"
+#include "ICameraSystem.hpp"
+#include "HardwareSyncedCameraSystem.hpp"
+#include "LogLevel.hpp"
+#include "GlobalLogger.hpp"
+#include "FlightRecorder.hpp"
+#include "LaunchData.hpp"
+#include "IBufferManager.hpp"
+#include "AtomicRingBuffer.hpp"
+#include "ITriggerDetector.hpp"
+#include "ROIFrameDifferencing.hpp"
+#include "IComputerVision.hpp"
+#include "OpenCVMomentsTracker.hpp"
+#include "ISpatialSolver.hpp"
+#include "StereoTriangulator.hpp"
+#include "IKinematicsSolver.hpp"
+#include "EigenBallisticsEngine.hpp"
+#include "INetworkTransmitter.hpp"
+#include "TcpJsonTransmitter.hpp"
+#include "SessionStateMachine.hpp"
+#include "ThreadManager.hpp"
+
 int main() {
     // Determine compiler-specific C++ standard version
     long cpp_version = __cplusplus;

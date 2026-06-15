@@ -12,7 +12,8 @@ find_package(spdlog REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
 # Define the executable target
-add_executable(GolfSim src/main.cpp)
+file(GLOB SOURCES "src/*.cpp")
+add_executable(GolfSim ${SOURCES})
 
 # Include directories
 target_include_directories(GolfSim PRIVATE
