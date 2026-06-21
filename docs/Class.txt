@@ -3,12 +3,17 @@ skinparam classAttributeIconSize 0
 skinparam packageStyle rectangle
 top to bottom direction
 
+' ─────────────────────────────────────────────
+' 1. Hardware Abstraction Layer (HAL)
+' No templates here — runtime polymorphism is
+' correct for driver swaps at startup (T.5)
+' ─────────────────────────────────────────────
 package "1. Hardware Abstraction Layer (HAL)" {
+
     interface IUsbVideoDriver <<Interface>> {
         +grabRawFrame() : cv::Mat
         +setHardwareExposure(microseconds: int) : void
     }
-    
 
     class V4L2Driver {
         -fileDescriptor : int
@@ -26,7 +31,13 @@ package "1. Hardware Abstraction Layer (HAL)" {
     IUsbVideoDriver <|.. MediaFoundationDriver
 }
 
+' ─────────────────────────────────────────────
+' 2. Camera Subsystem
+' Runtime polymorphism retained — camera
+' multiplexing and mock playback need it (T.5)
+' ─────────────────────────────────────────────
 package "2. Camera Subsystem" {
+
     enum CameraRole {
         STEREO_LEFT
         STEREO_RIGHT
@@ -68,7 +79,15 @@ package "2. Camera Subsystem" {
     HardwareSyncedCameraSystem o-- ICameraNode
 }
 
+' ─────────────────────────────────────────────
+' 3. Diagnostics & Telemetry
+'
+' T.3 — FlightRecorder::saveSession now accepts
+'        any range of FrameSets, not a concrete
+'        std::vector, via a constrained template.
+' ─────────────────────────────────────────────
 package "3. Diagnostics & Telemetry" {
+
     class GlobalLogger <<Singleton>> {
         -asyncQueue : spdlog::thread_pool
         -{static} instance : GlobalLogger*
@@ -77,28 +96,66 @@ package "3. Diagnostics & Telemetry" {
         +logError(msg: string) : void
         +setLevel(level: LogLevel) : void
     }
-    note right: Accessed via pragmatic macro:\nLOG_INFO("Matrix: {}", mat);
+    note right of GlobalLogger : Accessed via pragmatic macro:\nLOG_INFO("Matrix: {}", mat);
 
     class FlightRecorder {
         -outputDirectory : string
-        +saveSession(frames: std::vector<FrameSet>) : void
+        +saveSession<FrameRange>(frames: FrameRange) : void
     }
+    note right of FlightRecorder
+        T.3 — express containers & ranges\n
+        template<typename FrameRange>\n
+        requires std::ranges::range<FrameRange>\n
+        void saveSession(FrameRange&& frames);\n
+        Accepts span, deque, ring-buffer view, etc.
+    end note
 }
 
+' ─────────────────────────────────────────────
+' 4. Segregated Processing & Math Subsystem
+'
+' T.1 — AtomicRingBuffer<T,N>: raise abstraction,
+'        works for any payload type.
+' T.4 — LaunchData<AngleUnit,SpeedUnit>: strong
+'        unit types prevent mismatch at compile time.
+' T.5 — Policy interfaces kept for DI & testing;
+'        SessionStateMachine binds them statically.
+' ─────────────────────────────────────────────
 package "4. Segregated Processing & Math Subsystem" {
-    class LaunchData {
-        +ballSpeed : double
-        +verticalLaunchAngle : double
-        +horizontalLaunchAngle : double
+
+    class "LaunchData<AngleUnit, SpeedUnit>" as LaunchData {
+        +ballSpeed : SpeedUnit
+        +verticalLaunchAngle : AngleUnit
+        +horizontalLaunchAngle : AngleUnit
         +spinRPM : double
         +spinAxis : Eigen::Vector3d
     }
+    note right of LaunchData
+        T.4 — express syntax tree / strong types\n
+        template<typename AngleUnit,\n
+                 typename SpeedUnit>\n
+        struct LaunchData { ... };\n
+        Units enforced at compile time;\n
+        implicit conversions are errors.
+    end note
 
-    interface IBufferManager <<Interface>>
-    class AtomicRingBuffer {
-        -buffer : std::array<FrameSet, SIZE>
-        +push(set: FrameSet) : void
+    interface "IBufferManager<T>" as IBufferManager <<Interface>> {
+        +push(item: T) : void
+        +pop() : std::optional<T>
     }
+
+    class "AtomicRingBuffer<T, N>" as AtomicRingBuffer {
+        -buffer : std::array<T, N>
+        +push(item: T) : void
+        +pop() : std::optional<T>
+    }
+    note right of AtomicRingBuffer
+        T.1 — raise level of abstraction\n
+        template<typename T, std::size_t N>\n
+        class AtomicRingBuffer\n
+          : public IBufferManager<T> { ... };\n
+        No longer tied to FrameSet.
+    end note
 
     interface ITriggerDetector <<Interface>>
     class ROIFrameDifferencing
@@ -123,20 +180,45 @@ package "4. Segregated Processing & Math Subsystem" {
     INetworkTransmitter <|.. TcpJsonTransmitter
 }
 
+' ─────────────────────────────────────────────
+' 5. Segregated Orchestration
+'
+' T.2 — SessionStateMachine<Trigger,Vision,
+'        Spatial,Kinematics,Net> expresses the
+'        processing algorithm generically over
+'        any conforming policy types.
+' T.5 — OO interfaces above kept for DI/testing;
+'        template params used on the hot path to
+'        eliminate vtable overhead.
+' ─────────────────────────────────────────────
 package "5. Segregated Orchestration" {
-    class SessionStateMachine {
-        -trigger : ITriggerDetector
-        -vision : IComputerVision
-        -spatial : ISpatialSolver
-        -kinematics : IKinematicsSolver
-        -network : INetworkTransmitter
+
+    class "SessionStateMachine\n<Trigger, Vision, Spatial, Kinematics, Net>" as SessionStateMachine {
+        -trigger : Trigger
+        -vision : Vision
+        -spatial : Spatial
+        -kinematics : Kinematics
+        -network : Net
         -recorder : FlightRecorder
         +processNextFrame(set: FrameSet) : void
     }
+    note right of SessionStateMachine
+        T.2 — algorithms for many argument types\n
+        T.5 — combine generic + OO techniques\n\n
+        template<ITriggerDetector  Trigger,\n
+                 IComputerVision   Vision,\n
+                 ISpatialSolver    Spatial,\n
+                 IKinematicsSolver Kinematics,\n
+                 INetworkTransmitter Net>\n
+        class SessionStateMachine { ... };\n\n
+        Static dispatch on hot path;\n
+        concept constraints preserve\n
+        interface contracts for testing.
+    end note
 
     class ThreadManager {
         -cameraSystem : ICameraSystem
-        -buffer : IBufferManager
+        -buffer : IBufferManager<FrameSet>
         -stateMachine : SessionStateMachine
         +startProducerThread() : void
         +startConsumerThread() : void
@@ -146,7 +228,7 @@ package "5. Segregated Orchestration" {
     ThreadManager o-- IBufferManager
     ThreadManager o-- SessionStateMachine
     SessionStateMachine o-- FlightRecorder
-    
+
     SessionStateMachine ..> GlobalLogger : <<Uses>>
     ThreadManager ..> GlobalLogger : <<Uses>>
     EigenBallisticsEngine ..> GlobalLogger : <<Uses>>
