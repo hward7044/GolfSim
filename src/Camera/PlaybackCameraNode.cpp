@@ -1,3 +1,3 @@
 #include "Camera/PlaybackCameraNode.hpp"
-cv::Mat PlaybackCameraNode::captureFrame() { return cv::Mat(); }
+bool PlaybackCameraNode::captureFrame(cv::Mat& destination) { return false; }
 CameraRole PlaybackCameraNode::getRole() { return CameraRole::STEREO_LEFT; }

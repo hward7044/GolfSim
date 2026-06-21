@@ -8,6 +8,6 @@ template<typename T>
 class IBufferManager {
 public:
     virtual ~IBufferManager() = default;
-    virtual void push(T item) = 0;
+    virtual void push(const T& item) = 0;
     virtual std::optional<T> pop() = 0;
 };

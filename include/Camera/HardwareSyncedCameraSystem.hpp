@@ -7,5 +7,5 @@ class HardwareSyncedCameraSystem : public ICameraSystem {
 private:
     std::vector<std::shared_ptr<ICameraNode>> cameras;
 public:
-    FrameSet captureSynchronizedFrames() override;
+    bool captureSynchronizedFrames(FrameSet& frameSet) override;
 };

@@ -35,6 +35,11 @@ if(WIN32)
         mfplat
         mfreadwrite
         mfuuid
+        mf
+        ksuser
+        ole32
+        strmiids
         ws2_32
     )
 endif()
+

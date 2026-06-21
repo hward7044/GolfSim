@@ -5,6 +5,6 @@ class PlaybackCameraNode : public ICameraNode {
 private:
     std::string mockFilePath;
 public:
-    cv::Mat captureFrame() override;
+    bool captureFrame(cv::Mat& destination) override;
     CameraRole getRole() override;
 };

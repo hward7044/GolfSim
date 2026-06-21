@@ -1,2 +1,12 @@
 #include "Camera/HardwareSyncedCameraSystem.hpp"
-FrameSet HardwareSyncedCameraSystem::captureSynchronizedFrames() { return FrameSet(); }
+
+bool HardwareSyncedCameraSystem::captureSynchronizedFrames(FrameSet& frameSet) {
+    // Iterate cameras, write each frame into the FrameSet's pre-allocated slot
+    for (auto& camera : cameras) {
+        CameraRole role = camera->getRole();
+        if (!camera->captureFrame(frameSet.getFrame(role))) {
+            return false;
+        }
+    }
+    return true;
+}
