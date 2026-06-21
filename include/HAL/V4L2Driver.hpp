@@ -7,5 +7,6 @@ private:
 public:
     cv::Mat grabRawFrame() override;
     void setHardwareExposure(int microseconds) override;
+    void injectImmediateRegisterWrite(uint16_t reg, uint8_t value) override;
 };
 #endif

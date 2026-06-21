@@ -21,7 +21,7 @@
 #include "Math/IBufferManager.hpp"
 #include "Math/AtomicRingBuffer.hpp"
 #include "Math/ITriggerDetector.hpp"
-#include "Math/ROIFrameDifferencing.hpp"
+#include "Math/OpticalGateTrigger.hpp"
 #include "Math/IComputerVision.hpp"
 #include "Math/OpenCVMomentsTracker.hpp"
 #include "Math/ISpatialSolver.hpp"
