@@ -58,15 +58,15 @@ same optical axis.
 - The PC's job on hit-detection is reduced to sending one "FIRE" command with burst parameters (pulse count N, spacing T) — it does NOT attempt to time individual sub-millisecond pulses itself. General-purpose OS thread scheduling has jitter in the hundreds-of-microseconds-to-low-milliseconds range, which is far too coarse for pulse spacing that needs to be accurate to tens of microseconds.
 - The MCU generates the N-pulse train from a hardware timer and simultaneously drives the camera's external trigger line on the first pulse, so both cameras' exposure windows and the strobe sequence are locked together in hardware.
 
-3. THE HAL (PRODUCER THREAD) — redesigned capture flow
+3. THE HAL (PRODUCER THREAD) — Always-Triggered MCU Flow
 --------------------------------------------------------------------------------
-- Idle Mode: Unchanged — low-exposure, low-fps streaming, just enough for the optical gate to run.
+- Camera State: Set to hardware external-trigger mode with a constant fixed exposure window (e.g. 10 ms) during initialization. Exposure/trigger mode is never changed on-the-fly.
+- Idle Mode: The MCU triggers both cameras at a default low frame rate (e.g., 30 Hz) with 10 ms exposures. The IR strobe remains off (or fires a single low-power positioning pulse). The producer thread captures these frames continuously for the optical gate.
 - On Hit Detection:
-  1. PC sets the sensor's exposure register (via the documented trigger/exposure control path) to the full burst window length — e.g. N=6 pulses at ~1.2ms spacing → ~8–10ms total exposure with margin.
-  2. PC sends one FIRE command (with N and spacing, possibly adjusted from a rough pre-shot swing-speed estimate) to the MCU over UART/SPI.
-  3. MCU fires the timed pulse train via the MOSFET stage and asserts the camera's external trigger line on the first pulse.
-  4. Each camera returns ONE FRAME (optionally two, for redundancy) containing N distinct sharp ball images along the flight path — not a rapid-fire burst of separate frames.
-- This meaningfully simplifies the producer thread relative to Rev. 1: you're no longer managing a 100+ fps burst cache, just capturing and queuing one (or two) rich frames per shot per camera.
+  1. The PC immediately transmits a "FIRE" command with burst parameters (pulse count N, spacing T) to the MCU over UART serial.
+  2. Within the next scheduled trigger frame, the MCU fires the timed high-power N-pulse strobe train.
+  3. Each camera returns ONE FRAME (optionally two, for redundancy) containing N distinct sharp ball images along the flight path.
+- This bypasses all UVC/I2C register update latencies and VSYNC registration delays, maintaining a zero-latency hardware data-plane.
 - NO MATH ALLOWED HERE — HAL only captures and enqueues.
 
 4. THE ATOMIC RING BUFFER
@@ -82,7 +82,8 @@ same optical axis.
 - Goal: Robust, environment-agnostic swing detection independent of sound or static tee placement.
 - Setup: Define a fixed cv::Rect (Region of Interest) bounding box in the air 3 to 6 inches downrange from the physical tee location.
 - Trigger Math: Run a lightweight cv::absdiff() exclusively on this small ROI box between Frame(N) and a static background reference frame to count non-zero pixel deltas.
-- State Transition: When the ball crosses into the downrange box and pixel changes surpass MIN_BALL_PIXELS, the C++ producer instantly flags a hit. On confirmed hit, hands off to the HAL/MCU flow in §3 instead of directly flashing a single strobe.
+- State Transition: When the ball crosses into the downrange box and pixel changes surpass MIN_BALL_PIXELS, the C++ producer instantly flags a hit. On confirmed hit, hands off to the HAL/MCU flow in §3 (UART "FIRE" command).
+- Future Improvement: To combat ambient IR drift (e.g. slowly moving sun patches), future iterations should implement an exponential moving average (EMA) or multi-frame low-delta baseline refresh (`background = background * (1 - alpha) + current * alpha` with very small `alpha`) instead of a periodic static reference swap, preventing static shadow baking.
 
 6. MULTI-BLOB 2D TRACKING (position + marker glints)
 --------------------------------------------------------------------------------
@@ -111,7 +112,7 @@ the actual fix for the aliasing problem identified during review:
   1. For each consecutive pulse pair (i, i+1) where at least 2 non-antipodal markers are visible in both, compute the incremental rotation via the same cross-covariance + Eigen::JacobiSVD Procrustes approach as Rev. 1 (H from centered marker sets → U, Σ, Vᵀ → R = V·Uᵀ).
   2. Because pulse spacing is chosen to keep inter-pulse rotation under ~45°, each incremental fit stays well clear of the aliasing/wraparound region that broke the two-frame approach.
   3. Least-squares fit a constant angular velocity and axis across all valid incremental rotations for the shot, rather than trusting any single pair — this also gives you a natural way to detect and discount a bad increment (e.g. from a marker misidentification) as an outlier.
-  4. PULSE SPACING TARGET: T_max(ms) ≈ 7500 / RPM_expected. Concretely: driver-range spin (~2,500–3,000 RPM) tolerates ~2.5–3ms spacing; wedge-range spin (~8,000–10,000+ RPM) needs ~0.75–0.85ms spacing. A fixed default (e.g. 6 pulses @ ~1.2ms) is a reasonable MVP starting point covering mid-range clubs; a stretch goal is adjusting N/spacing per shot from a rough pre-impact swing-speed estimate.
+  4. PULSE SPACING TARGET: T_max(ms) ≈ 7500 / RPM_expected. Concretely: driver-range spin (~2,500–3,000 RPM) tolerates ~2.5–3ms spacing; wedge-range spin (~8,000–10,000+ RPM) needs ~0.75–0.85ms spacing. These pulses are timed and generated by the MCU entirely within the fixed 10 ms camera integration window. A fixed default (e.g. 6 pulses @ ~1.2ms) is a reasonable MVP starting point covering mid-range clubs.
   5. Report RPM and axis exactly as Rev. 1: Angle = arccos((Trace(R)-1)/2), RPM = (Angle/Δt) × (60/2π); axis = eigenvector of R for eigenvalue 1 — the math is unchanged, only the sampling strategy that feeds it.
 
 9. TCP TELEMETRY

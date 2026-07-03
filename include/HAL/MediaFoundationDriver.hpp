@@ -43,6 +43,7 @@ private:
     bool enumerateAndOpenDevice();
     bool configureSourceReader();
     bool discoverExtensionUnit();
+    void configureTriggerAndExposureSettings();
 
 public:
     MediaFoundationDriver();
@@ -58,7 +59,7 @@ public:
     bool initialize();
 
     /// @brief Release all COM resources and shut down MF. Safe to call multiple times.
-    void shutdown();
+    void shutdown() override;
 
     /// @brief Check if the driver has been successfully initialized.
     bool isInitialized() const noexcept { return initialized_; }

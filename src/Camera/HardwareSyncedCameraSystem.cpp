@@ -10,3 +10,9 @@ bool HardwareSyncedCameraSystem::captureSynchronizedFrames(FrameSet& frameSet) {
     }
     return true;
 }
+
+void HardwareSyncedCameraSystem::shutdown() {
+    for (auto& camera : cameras) {
+        camera->shutdown();
+    }
+}

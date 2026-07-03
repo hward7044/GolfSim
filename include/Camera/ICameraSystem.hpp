@@ -7,4 +7,5 @@ public:
     /// @param frameSet Pre-allocated FrameSet with pre-allocated cv::Mat buffers.
     /// @return true if all cameras captured successfully.
     virtual bool captureSynchronizedFrames(FrameSet& frameSet) = 0;
+    virtual void shutdown() {}
 };
