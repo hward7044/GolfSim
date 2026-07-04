@@ -35,6 +35,11 @@
 #include "Math/TcpJsonTransmitter.hpp"
 #include "Orchestration/SessionStateMachine.hpp"
 #include "Orchestration/ThreadManager.hpp"
+#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+
+const bool RUN_DEBUG_VIEWER = false;
+void runCameraDebugViewer();
 
 int main() {
     // Determine compiler-specific C++ standard version
@@ -75,10 +80,115 @@ int main() {
     
     // Run C++ Math Verification Tests
     void runMathTests();
-    // runMathTests(); // Commented out to focus on camera hookup and streaming test
+    runMathTests(); // Run verification tests on startup
 
     std::cout << "Verification completed successfully!" << std::endl;
 
+    if (RUN_DEBUG_VIEWER) {
+        runCameraDebugViewer();
+        return 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // Production Launch Monitor Pipeline
+    // -------------------------------------------------------------------------
+    std::cout << "\n============================================" << std::endl;
+    std::cout << "Starting Production Launch Monitor Pipeline" << std::endl;
+    std::cout << "============================================" << std::endl;
+
+    // Configure spdlog to write to both console and build/session.log
+    try {
+        auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+        auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>("build/session.log", true);
+        spdlog::set_default_logger(std::make_shared<spdlog::logger>("multi_sink", spdlog::sinks_init_list({console_sink, file_sink})));
+        spdlog::set_level(spdlog::level::info);
+        spdlog::flush_on(spdlog::level::info);
+    } catch (const spdlog::spdlog_ex& ex) {
+        std::cerr << "Log initialization failed: " << ex.what() << std::endl;
+    }
+
+    spdlog::info("[System] Initializing camera drivers...");
+    MediaFoundationDriver::logConnectedDevices();
+
+    // 2. Initialize the MediaFoundationDrivers
+    auto usbLeft = std::make_unique<MediaFoundationDriver>(0);
+    bool leftOk = usbLeft->initialize();
+    
+    auto usbRight = std::make_unique<MediaFoundationDriver>(1);
+    bool rightOk = usbRight->initialize();
+
+    if (!leftOk && !rightOk) {
+        spdlog::error("[System] Failed to initialize either camera. Exiting.");
+        return -1;
+    }
+
+    auto cameraSystem = std::make_shared<HardwareSyncedCameraSystem>();
+    uint32_t width = 1280;
+    uint32_t height = 800;
+
+    if (leftOk) {
+        width = usbLeft->getFrameWidth();
+        height = usbLeft->getFrameHeight();
+        auto cameraNodeLeft = std::make_shared<OV9281CameraNode>(std::move(usbLeft), CameraRole::STEREO_LEFT);
+        cameraSystem->addCameraNode(cameraNodeLeft);
+        spdlog::info("[System] Successfully registered Left camera ({}x{})", width, height);
+    }
+
+    if (rightOk) {
+        width = usbRight->getFrameWidth();
+        height = usbRight->getFrameHeight();
+        auto cameraNodeRight = std::make_shared<OV9281CameraNode>(std::move(usbRight), CameraRole::STEREO_RIGHT);
+        cameraSystem->addCameraNode(cameraNodeRight);
+        spdlog::info("[System] Successfully registered Right camera ({}x{})", width, height);
+    }
+
+    // Queue buffer manager (capacity of 16 FrameSets)
+    auto buffer = std::make_shared<AtomicRingBuffer<FrameSet, 16>>();
+
+    // Pipeline components initialization:
+    // - Left camera optical gate trigger (Region of Interest, min Ball pixels, diff threshold, EMA alpha)
+    // - Image Moments tracker (Ball threshold, Marker threshold, min Area, max Area, min Circularity)
+    // - Stereo Triangulator (Uses default horizontal calibration)
+    // - Kinematics physics engine
+    // - Local network TCP transmitter (Target loopback, port 9002)
+    cv::Rect triggerRoi(100, 100, 400, 400);
+    auto trigger = OpticalGateTrigger(triggerRoi, 150, 25, 0.05);
+    auto vision = OpenCVMomentsTracker(80, 240, 80.0, 2500.0, 0.5);
+    auto spatial = StereoTriangulator();
+    auto kinematics = EigenBallisticsEngine();
+    auto network = TcpJsonTransmitter("127.0.0.1", 9002);
+
+    auto stateMachine = std::make_shared<ConcreteSSM>(
+        trigger,
+        vision,
+        spatial,
+        kinematics,
+        network
+    );
+
+    auto threadManager = std::make_shared<ThreadManager>(
+        cameraSystem,
+        buffer,
+        stateMachine
+    );
+
+    spdlog::info("[System] Starting background acquisition and tracking threads...");
+    threadManager->startProducerThread();
+    threadManager->startConsumerThread();
+
+    spdlog::info("[System] System is online and monitoring. Press Enter to shutdown.");
+    std::cin.get();
+
+    spdlog::info("[System] Shutting down threads...");
+    threadManager->stop();
+    spdlog::info("[System] Shutdown completed cleanly.");
+    return 0;
+}
+
+// -------------------------------------------------------------------------
+// Live Camera Setup and Test Viewer (RUN_DEBUG_VIEWER = true)
+// -------------------------------------------------------------------------
+void runCameraDebugViewer() {
     std::cout << "\n============================================" << std::endl;
     std::cout << "Starting Live Camera Hookup and Test" << std::endl;
     std::cout << "============================================" << std::endl;
@@ -97,7 +207,7 @@ int main() {
 
     if (!leftOk && !rightOk) {
         std::cerr << "Failed to initialize either camera. Are they connected?" << std::endl;
-        return -1;
+        return;
     }
 
     // 3 & 4. Create and Register the nodes with the camera system
@@ -202,7 +312,6 @@ int main() {
         cv::Mat frameToDraw;
         if (currentMode == VIEW_BOTH) {
             if (!displayLeft.empty() && !displayRight.empty()) {
-                // Resize both to exact equal size (640x400 each) to share screen 50/50
                 cv::Mat resizedLeft, resizedRight;
                 cv::resize(displayLeft, resizedLeft, cv::Size(640, 400));
                 cv::resize(displayRight, resizedRight, cv::Size(640, 400));
@@ -247,7 +356,5 @@ int main() {
     std::cout << "\nStopping acquisition..." << std::endl;
     cv::destroyAllWindows();
     cameraSystem.shutdown();
-
     std::cout << "Shutdown completed cleanly." << std::endl;
-    return 0;
 }

@@ -41,7 +41,11 @@ private:
     std::jthread                            consumerThread_;
 
 public:
-    ThreadManager() = default;
+    ThreadManager(
+        std::shared_ptr<ICameraSystem> camSys,
+        std::shared_ptr<IBufferManager<FrameSet>> buf,
+        std::shared_ptr<ConcreteSSM> sm
+    );
     ~ThreadManager();
 
     // Prevent copying

@@ -7,6 +7,12 @@
 #include "Math/INetworkTransmitter.hpp"
 #include "Diagnostics/FlightRecorder.hpp"
 
+#include <vector>
+#include <fstream>
+#include <chrono>
+#include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
+
 // T.2 — algorithms for many argument types
 // T.5 — combine generic + OO techniques
 //
@@ -53,8 +59,120 @@ private:
     Kinematics     kinematics;
     Net            network;
     FlightRecorder recorder;
+
+    // Track state across incoming frames
+    std::vector<Ball3D> trajectoryBuffer;
+    int            emptyFrameCount = 0;
+    bool           inShot = false;
+
+    // Helper to log solved shot data to build/shot_history.json
+    void saveToShotHistory(const LaunchData<Degrees, MilesPerHour>& data) {
+        nlohmann::json j;
+        j["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        j["ballSpeed_mph"] = data.ballSpeed.value();
+        j["verticalLaunchAngle_deg"] = data.verticalLaunchAngle.value();
+        j["horizontalLaunchAngle_deg"] = data.horizontalLaunchAngle.value();
+        j["spinRPM"] = data.spinRPM;
+        j["spinAxis"] = { data.spinAxis.x(), data.spinAxis.y(), data.spinAxis.z() };
+
+        // Append to JSON Lines file for easy programmatic parsing
+        std::ofstream out("build/shot_history.json", std::ios::app);
+        if (out.is_open()) {
+            out << j.dump() << "\n";
+            out.close();
+        } else {
+            std::ofstream outFallback("shot_history.json", std::ios::app);
+            if (outFallback.is_open()) {
+                outFallback << j.dump() << "\n";
+                outFallback.close();
+            }
+        }
+    }
+
 public:
+    SessionStateMachine(
+        Trigger t = Trigger(),
+        Vision v = Vision(),
+        Spatial s = Spatial(),
+        Kinematics k = Kinematics(),
+        Net n = Net()
+    ) : trigger(std::move(t)),
+        vision(std::move(v)),
+        spatial(std::move(s)),
+        kinematics(std::move(k)),
+        network(std::move(n)) {}
+
     void processNextFrame(const FrameSet& set) {
-        // Stub: check trigger, run vision/spatial/kinematics pipeline, transmit
+        cv::Mat leftFrame = set.getFrame(CameraRole::STEREO_LEFT);
+        cv::Mat rightFrame = set.getFrame(CameraRole::STEREO_RIGHT);
+
+        if (leftFrame.empty() || rightFrame.empty()) {
+            return;
+        }
+
+        // 1. If not currently in a shot, monitor the optical gate for trigger event
+        if (!inShot) {
+            if (trigger.checkOpticalGate(leftFrame)) {
+                inShot = true;
+                trajectoryBuffer.clear();
+                emptyFrameCount = 0;
+                spdlog::info("[SessionStateMachine] Optical gate triggered! Starting shot capture...");
+            }
+        }
+
+        // 2. If swing is triggered, detect and triangulate coordinates
+        if (inShot) {
+            auto leftBalls = vision.detectBalls(leftFrame);
+            auto rightBalls = vision.detectBalls(rightFrame);
+
+            if (!leftBalls.empty() || !rightBalls.empty()) {
+                std::vector<Ball3D> triangulated = spatial.triangulateShot(leftBalls, rightBalls);
+
+                if (!triangulated.empty()) {
+                    trajectoryBuffer.insert(trajectoryBuffer.end(), triangulated.begin(), triangulated.end());
+                    emptyFrameCount = 0;
+                } else {
+                    emptyFrameCount++;
+                }
+            } else {
+                emptyFrameCount++;
+            }
+
+            // 3. Option C Completion Check:
+            //    - emptyFrameCount >= 5 (ball has left the frame) OR
+            //    - trajectoryBuffer.size() >= 25 (safety cutoff)
+            if (emptyFrameCount >= 5 || trajectoryBuffer.size() >= 25) {
+                spdlog::info("[SessionStateMachine] Shot capture completed. Buffered points: {}, Empty frames: {}", 
+                             trajectoryBuffer.size(), emptyFrameCount);
+
+                if (trajectoryBuffer.size() >= 3) {
+                    spdlog::info("[SessionStateMachine] Solving shot kinematics...");
+                    // Strobe interval is 1.0ms
+                    LaunchData<Degrees, MilesPerHour> launchData = kinematics.solveKinematics(trajectoryBuffer, 1.0);
+
+                    spdlog::info("[SessionStateMachine] Shot Solved: Speed={:.1f} mph | VLA={:.1f} deg | HLA={:.1f} deg | Spin={:.0f} RPM",
+                                 launchData.ballSpeed.value(), launchData.verticalLaunchAngle.value(),
+                                 launchData.horizontalLaunchAngle.value(), launchData.spinRPM);
+
+                    // Transmit JSON payload to clients
+                    network.transmitLaunchData(launchData);
+
+                    // Save shot parameters to file
+                    saveToShotHistory(launchData);
+
+                    // Save raw data to FlightRecorder
+                    recorder.saveSession(trajectoryBuffer);
+                } else {
+                    spdlog::warn("[SessionStateMachine] Trajectory buffer has insufficient points ({}) to solve. Shot discarded.", 
+                                 trajectoryBuffer.size());
+                }
+
+                // Reset state parameters
+                inShot = false;
+                trajectoryBuffer.clear();
+                emptyFrameCount = 0;
+            }
+        }
     }
 };

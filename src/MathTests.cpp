@@ -106,18 +106,18 @@ void testStereoTriangulatorAndRaySphere() {
 
     BallObservation bL, bR;
     bL.centroid = cv::Point2d(640.0, 400.0);
-    bR.centroid = cv::Point2d(706.666667, 400.0);
+    bR.centroid = cv::Point2d(573.333333, 400.0);
 
     // Put a marker at (0.0, 0.021335, 1.5) in world (on the ball's top surface)
     // Left projection: X=0, Y=0.021335, Z=1.5
     // u = 1000 * 0 + 640 = 640
     // v = 1000 * (0.021335 / 1.5) + 400 = 414.2233
-    // Right projection: X=0.1, Y=0.021335, Z=1.5
-    // u_R = 1000 * (0.1 / 1.5) + 640 = 706.667
+    // Right projection: X=-0.1, Y=0.021335, Z=1.5 (since Right camera center is at T_x = -0.1 relative to Left)
+    // u_R = 1000 * (-0.1 / 1.5) + 640 = 573.3333
     // v_R = 1000 * (0.021335 / 1.5) + 400 = 414.2233
     MarkerObservation ml, mr;
     ml.position = cv::Point2d(640.0, 414.2233);
-    mr.position = cv::Point2d(706.6667, 414.2233);
+    mr.position = cv::Point2d(573.333333, 414.2233);
 
     bL.markers.push_back(ml);
     bR.markers.push_back(mr);

@@ -2,6 +2,12 @@
 #include <spdlog/spdlog.h>
 #include <chrono>
 
+ThreadManager::ThreadManager(
+    std::shared_ptr<ICameraSystem> camSys,
+    std::shared_ptr<IBufferManager<FrameSet>> buf,
+    std::shared_ptr<ConcreteSSM> sm
+) : cameraSystem(camSys), buffer(buf), stateMachine(sm) {}
+
 ThreadManager::~ThreadManager() {
     stop();
 }
