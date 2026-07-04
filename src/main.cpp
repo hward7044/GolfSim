@@ -69,6 +69,11 @@ int main() {
     std::cout << "OpenCV Matrix created successfully. Dimensions: " << image.rows << "x" << image.cols << std::endl;
 
     std::cout << "============================================" << std::endl;
+    
+    // Run C++ Math Verification Tests
+    void runMathTests();
+    runMathTests();
+
     std::cout << "Verification completed successfully!" << std::endl;
     return 0;
 }

@@ -4,11 +4,24 @@
 
 class OpticalGateTrigger : public ITriggerDetector {
 private:
-    // Bounding box of the downrange 3-inch optical gate region
     cv::Rect gateROI;
-    // Reference background frame for differencing
-    cv::Mat  backgroundRef;
+    cv::Mat  backgroundRef; // Stored as CV_32FC1 for precise EMA updates
+    cv::Mat  backgroundRef8U; // 8-bit cached background for fast integer diffs
+    cv::Mat  grayRoi;
+    cv::Mat  diff8U;
+    cv::Mat  thresh;
+    cv::Mat  currentRoiFloat;
+    int      minBallPixels;
+    int      pixelDiffThreshold;
+    double   alpha;
 public:
-    // Executes lightweight cv::absdiff exclusively on gateROI to detect ball passage.
+    OpticalGateTrigger(
+        cv::Rect roi = cv::Rect(400, 300, 200, 200), 
+        int minPixels = 150, 
+        int threshold = 20, 
+        double alphaVal = 0.005
+    );
+
     bool checkOpticalGate(const cv::Mat& currentFrame) override;
 };
+
