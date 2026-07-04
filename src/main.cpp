@@ -86,34 +86,58 @@ int main() {
     // 1. Enumerate and log all connected video capture devices on the system
     MediaFoundationDriver::logConnectedDevices();
 
-    // 2. Initialize the MediaFoundationDriver for device index 0
-    std::cout << "\nInitializing camera driver for device index 0..." << std::endl;
-    auto usbDriver = std::make_unique<MediaFoundationDriver>(0);
+    // 2. Initialize the MediaFoundationDrivers
+    std::cout << "\nInitializing camera driver 0 (Left)..." << std::endl;
+    auto usbDriverLeft = std::make_unique<MediaFoundationDriver>(0);
+    bool leftOk = usbDriverLeft->initialize();
     
-    if (!usbDriver->initialize()) {
-        std::cerr << "Failed to initialize MediaFoundationDriver for device 0. Is the camera connected?" << std::endl;
+    std::cout << "Initializing camera driver 1 (Right)..." << std::endl;
+    auto usbDriverRight = std::make_unique<MediaFoundationDriver>(1);
+    bool rightOk = usbDriverRight->initialize();
+
+    if (!leftOk && !rightOk) {
+        std::cerr << "Failed to initialize either camera. Are they connected?" << std::endl;
         return -1;
     }
 
-    uint32_t width = usbDriver->getFrameWidth();
-    uint32_t height = usbDriver->getFrameHeight();
-    std::cout << "Successfully initialized driver! Resolution: " 
-              << width << "x" << height << std::endl;
-
-    // 3. Create the OV9281CameraNode wrapping the driver
-    auto cameraNode = std::make_shared<OV9281CameraNode>(std::move(usbDriver), CameraRole::STEREO_LEFT);
-
-    // 4. Register the node with the camera system
+    // 3 & 4. Create and Register the nodes with the camera system
     HardwareSyncedCameraSystem cameraSystem;
-    cameraSystem.addCameraNode(cameraNode);
+    uint32_t width = 1280;
+    uint32_t height = 800;
+
+    if (leftOk) {
+        width = usbDriverLeft->getFrameWidth();
+        height = usbDriverLeft->getFrameHeight();
+        auto cameraNodeLeft = std::make_shared<OV9281CameraNode>(std::move(usbDriverLeft), CameraRole::STEREO_LEFT);
+        cameraSystem.addCameraNode(cameraNodeLeft);
+        std::cout << "Successfully initialized Left camera! Resolution: " << width << "x" << height << std::endl;
+    } else {
+        std::cout << "Left camera was not detected/initialized." << std::endl;
+    }
+
+    if (rightOk) {
+        width = usbDriverRight->getFrameWidth();
+        height = usbDriverRight->getFrameHeight();
+        auto cameraNodeRight = std::make_shared<OV9281CameraNode>(std::move(usbDriverRight), CameraRole::STEREO_RIGHT);
+        cameraSystem.addCameraNode(cameraNodeRight);
+        std::cout << "Successfully initialized Right camera! Resolution: " << width << "x" << height << std::endl;
+    } else {
+        std::cout << "Right camera was not detected/initialized." << std::endl;
+    }
 
     // 5. Pre-allocate the FrameSet buffer
     FrameSet frameSet;
     frameSet.preallocate(width, height);
 
-    std::cout << "\nStarting live video display. Press ESC in the video window to quit." << std::endl;
+    enum ViewMode { VIEW_BOTH, VIEW_LEFT_ONLY, VIEW_RIGHT_ONLY };
+    int currentMode = VIEW_BOTH;
 
-    cv::namedWindow("OV9281 Camera Live Feed", cv::WINDOW_AUTOSIZE);
+    std::cout << "\nStarting live video display. Controls:" << std::endl;
+    std::cout << "  - Press TAB or 'v' inside the video window to cycle views (Both -> Left -> Right)" << std::endl;
+    std::cout << "  - Press ESC to quit" << std::endl;
+
+    std::string windowName = "Stereo Cameras Live Feed";
+    cv::namedWindow(windowName, cv::WINDOW_AUTOSIZE);
 
     auto start_time = std::chrono::steady_clock::now();
     uint32_t frame_count = 0;
@@ -121,7 +145,7 @@ int main() {
 
     while (true) {
         if (!cameraSystem.captureSynchronizedFrames(frameSet)) {
-            std::cerr << "Failed to capture frame!" << std::endl;
+            std::cerr << "Failed to capture frames!" << std::endl;
             std::this_thread::sleep_for(std::chrono::milliseconds(30));
             continue;
         }
@@ -137,37 +161,86 @@ int main() {
             start_time = current_time;
         }
 
-        // Get the frame
-        cv::Mat frame = frameSet.getFrame(CameraRole::STEREO_LEFT);
-        if (!frame.empty()) {
-            // Calculate diagnostics: mean pixel intensity
-            cv::Scalar meanVal = cv::mean(frame);
-            
-            // Print diagnostics to console (throttled to avoid spamming too fast)
-            if (frame_count % 30 == 0) {
-                std::cout << "Frame Stats: Resolution=" << frame.cols << "x" << frame.rows 
-                          << " | Avg Pixel Intensity=" << std::fixed << std::setprecision(1) << meanVal[0]
-                          << " | Live FPS=" << std::setprecision(2) << fps << "\r" << std::flush;
-            }
+        // Get the frames
+        cv::Mat leftFrame = frameSet.getFrame(CameraRole::STEREO_LEFT);
+        cv::Mat rightFrame = frameSet.getFrame(CameraRole::STEREO_RIGHT);
 
-            // Draw overlay text on the image
-            cv::Mat displayFrame;
-            // Convert to color so we can draw colorful text
-            cv::cvtColor(frame, displayFrame, cv::COLOR_GRAY2BGR);
+        cv::Scalar meanLeft = leftFrame.empty() ? cv::Scalar(0) : cv::mean(leftFrame);
+        cv::Scalar meanRight = rightFrame.empty() ? cv::Scalar(0) : cv::mean(rightFrame);
 
-            std::string fpsText = "FPS: " + std::to_string(fps).substr(0, 5);
-            std::string intText = "Intensity: " + std::to_string(meanVal[0]).substr(0, 4);
-            cv::putText(displayFrame, fpsText, cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
-            cv::putText(displayFrame, intText, cv::Point(20, 80), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
-
-            // Display frame
-            cv::imshow("OV9281 Camera Live Feed", displayFrame);
+        // Print stats periodically to console
+        if (frame_count % 30 == 0) {
+            std::cout << "Frame Stats: L=" 
+                      << (leftFrame.empty() ? "N/A" : std::to_string(leftFrame.cols) + "x" + std::to_string(leftFrame.rows))
+                      << " (Avg=" << std::fixed << std::setprecision(1) << meanLeft[0] << ")"
+                      << " | R=" 
+                      << (rightFrame.empty() ? "N/A" : std::to_string(rightFrame.cols) + "x" + std::to_string(rightFrame.rows))
+                      << " (Avg=" << meanRight[0] << ")"
+                      << " | ViewMode=" << (currentMode == VIEW_BOTH ? "BOTH" : (currentMode == VIEW_LEFT_ONLY ? "LEFT" : "RIGHT"))
+                      << " | FPS=" << std::setprecision(2) << fps << "\r" << std::flush;
         }
 
-        // Break on ESC key
+        // Draw overlays
+        std::string fpsText = "FPS: " + std::to_string(fps).substr(0, 5);
+        cv::Mat displayLeft, displayRight;
+
+        if (!leftFrame.empty()) {
+            cv::cvtColor(leftFrame, displayLeft, cv::COLOR_GRAY2BGR);
+            std::string intTextL = "Intensity: " + std::to_string(meanLeft[0]).substr(0, 4);
+            cv::putText(displayLeft, "LEFT " + fpsText, cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
+            cv::putText(displayLeft, intTextL, cv::Point(20, 80), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
+        }
+
+        if (!rightFrame.empty()) {
+            cv::cvtColor(rightFrame, displayRight, cv::COLOR_GRAY2BGR);
+            std::string intTextR = "Intensity: " + std::to_string(meanRight[0]).substr(0, 4);
+            cv::putText(displayRight, "RIGHT " + fpsText, cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
+            cv::putText(displayRight, intTextR, cv::Point(20, 80), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
+        }
+
+        // Build composite image based on active view mode
+        cv::Mat frameToDraw;
+        if (currentMode == VIEW_BOTH) {
+            if (!displayLeft.empty() && !displayRight.empty()) {
+                // Resize both to exact equal size (640x400 each) to share screen 50/50
+                cv::Mat resizedLeft, resizedRight;
+                cv::resize(displayLeft, resizedLeft, cv::Size(640, 400));
+                cv::resize(displayRight, resizedRight, cv::Size(640, 400));
+                cv::hconcat(resizedLeft, resizedRight, frameToDraw);
+            } else if (!displayLeft.empty()) {
+                frameToDraw = displayLeft;
+            } else if (!displayRight.empty()) {
+                frameToDraw = displayRight;
+            }
+        } else if (currentMode == VIEW_LEFT_ONLY) {
+            if (!displayLeft.empty()) {
+                frameToDraw = displayLeft;
+            } else {
+                frameToDraw = cv::Mat::zeros(400, 640, CV_8UC3);
+                cv::putText(frameToDraw, "LEFT CAMERA OFFLINE", cv::Point(120, 200), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
+            }
+        } else if (currentMode == VIEW_RIGHT_ONLY) {
+            if (!displayRight.empty()) {
+                frameToDraw = displayRight;
+            } else {
+                frameToDraw = cv::Mat::zeros(400, 640, CV_8UC3);
+                cv::putText(frameToDraw, "RIGHT CAMERA OFFLINE", cv::Point(120, 200), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
+            }
+        }
+
+        if (!frameToDraw.empty()) {
+            cv::imshow(windowName, frameToDraw);
+        }
+
+        // Break on ESC key, toggle views on TAB (9) or v/V (118/86)
         int key = cv::waitKey(1);
         if (key == 27) {
             break;
+        } else if (key == 9 || key == 118 || key == 86) {
+            currentMode = (currentMode + 1) % 3;
+            std::cout << "\nSwitched View Mode to: " 
+                      << (currentMode == VIEW_BOTH ? "BOTH (50/50)" : (currentMode == VIEW_LEFT_ONLY ? "LEFT ONLY" : "RIGHT ONLY")) 
+                      << std::endl;
         }
     }
 
