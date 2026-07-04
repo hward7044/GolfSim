@@ -16,6 +16,8 @@ using Microsoft::WRL::ComPtr;
 
 class MediaFoundationDriver : public IUsbVideoDriver {
 private:
+    uint32_t                 deviceIndex_ = 0;
+
     // --- Lifecycle guard ---
     bool initialized_ = false;
     bool comInitializedByUs_ = false;
@@ -46,7 +48,7 @@ private:
     void configureTriggerAndExposureSettings();
 
 public:
-    MediaFoundationDriver();
+    explicit MediaFoundationDriver(uint32_t deviceIndex = 0);
     ~MediaFoundationDriver();
 
     // Prevent copy and move
@@ -68,6 +70,9 @@ public:
     uint32_t getFrameWidth() const noexcept { return frameWidth_; }
     /// @brief Returns the frame height resolved at initialization.
     uint32_t getFrameHeight() const noexcept { return frameHeight_; }
+
+    /// @brief Enumerate and log all connected video capture devices.
+    static void logConnectedDevices();
 
     // --- IUsbVideoDriver interface ---
     bool grabRawFrame(cv::Mat& destination) override;

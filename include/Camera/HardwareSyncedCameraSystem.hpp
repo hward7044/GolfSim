@@ -8,5 +8,6 @@ private:
     std::vector<std::shared_ptr<ICameraNode>> cameras;
 public:
     bool captureSynchronizedFrames(FrameSet& frameSet) override;
+    void addCameraNode(std::shared_ptr<ICameraNode> camera);
     void shutdown() override;
 };

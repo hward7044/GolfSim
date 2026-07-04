@@ -39,7 +39,8 @@ static constexpr DWORD ARDUCAM_XU_CONTROL_ID = 1;
 // Construction / Destruction
 // =============================================================================
 
-MediaFoundationDriver::MediaFoundationDriver() = default;
+MediaFoundationDriver::MediaFoundationDriver(uint32_t deviceIndex)
+    : deviceIndex_(deviceIndex) {}
 
 MediaFoundationDriver::~MediaFoundationDriver() {
     shutdown();
@@ -163,6 +164,7 @@ bool MediaFoundationDriver::enumerateAndOpenDevice() {
     if (FAILED(hr) || count == 0) return false;
 
     bool found = false;
+    uint32_t matchCount = 0;
     for (UINT32 i = 0; i < count; ++i) {
         if (!ppDevices[i]) continue;  // Defensive null check
 
@@ -189,28 +191,93 @@ bool MediaFoundationDriver::enumerateAndOpenDevice() {
         CoTaskMemFree(szFriendlyName);
         CoTaskMemFree(szLinks);
 
-        // Match by VID/PID in symbolic link, or by known camera name strings
+        bool isMatch = false;
         if (linkStr.find(TARGET_VID) != std::wstring::npos &&
             linkStr.find(TARGET_PID) != std::wstring::npos) {
-            // Best match: both VID and PID
-            hr = ppDevices[i]->ActivateObject(IID_PPV_ARGS(&mediaSource_));
-            if (SUCCEEDED(hr)) {
-                found = true;
+            isMatch = true;
+        } else if (nameStr.find(L"Arducam") != std::wstring::npos ||
+                   nameStr.find(L"OV9281")  != std::wstring::npos) {
+            isMatch = true;
+        }
+
+        if (isMatch) {
+            if (matchCount == deviceIndex_) {
+                hr = ppDevices[i]->ActivateObject(IID_PPV_ARGS(&mediaSource_));
+                if (SUCCEEDED(hr)) {
+                    found = true;
+                    std::string narrowName(nameStr.begin(), nameStr.end());
+                    spdlog::info("[MediaFoundationDriver] Successfully activated device at index {} (Name: {})",
+                                 deviceIndex_, narrowName);
+                }
             }
-        } else if (!found && (
-            nameStr.find(L"Arducam") != std::wstring::npos ||
-            nameStr.find(L"OV9281")  != std::wstring::npos)) {
-            // Fallback: match by friendly name
-            hr = ppDevices[i]->ActivateObject(IID_PPV_ARGS(&mediaSource_));
-            if (SUCCEEDED(hr)) {
-                found = true;
-            }
+            matchCount++;
         }
 
         ppDevices[i]->Release();
     }
     CoTaskMemFree(ppDevices);
     return found;
+}
+
+void MediaFoundationDriver::logConnectedDevices() {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    bool comInit = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+    bool comShouldUninit = (hr == S_OK || hr == S_FALSE);
+
+    hr = MFStartup(MF_VERSION);
+    bool mfInit = SUCCEEDED(hr);
+
+    if (mfInit) {
+        ComPtr<IMFAttributes> pAttributes;
+        hr = MFCreateAttributes(&pAttributes, 1);
+        if (SUCCEEDED(hr)) {
+            hr = pAttributes->SetGUID(
+                MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID
+            );
+            if (SUCCEEDED(hr)) {
+                UINT32 count = 0;
+                IMFActivate** ppDevices = nullptr;
+                hr = MFEnumDeviceSources(pAttributes.Get(), &ppDevices, &count);
+                if (SUCCEEDED(hr)) {
+                    spdlog::info("[MediaFoundationDriver] Enumerating connected video devices (Total: {}):", count);
+                    for (UINT32 i = 0; i < count; ++i) {
+                        if (!ppDevices[i]) continue;
+                        WCHAR* szFriendlyName = nullptr;
+                        UINT32 cchFriendlyName = 0;
+                        ppDevices[i]->GetAllocatedString(
+                            MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &szFriendlyName, &cchFriendlyName
+                        );
+
+                        WCHAR* szLinks = nullptr;
+                        UINT32 cchLinks = 0;
+                        ppDevices[i]->GetAllocatedString(
+                            MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, &szLinks, &cchLinks
+                        );
+
+                        std::wstring nameW(szFriendlyName ? szFriendlyName : L"");
+                        std::wstring linkW(szLinks ? szLinks : L"");
+
+                        std::string nameStr(nameW.begin(), nameW.end());
+                        std::string linkStr(linkW.begin(), linkW.end());
+
+                        spdlog::info("  Device [{}]:", i);
+                        spdlog::info("    Name: {}", nameStr);
+                        spdlog::info("    Link: {}", linkStr);
+
+                        CoTaskMemFree(szFriendlyName);
+                        CoTaskMemFree(szLinks);
+                        ppDevices[i]->Release();
+                    }
+                    CoTaskMemFree(ppDevices);
+                }
+            }
+        }
+        MFShutdown();
+    }
+    if (comInit && comShouldUninit) {
+        CoUninitialize();
+    }
 }
 
 // =============================================================================

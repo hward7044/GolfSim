@@ -32,6 +32,16 @@ static Eigen::Vector3d toEigenVec(const cv::Mat& m) {
     return Eigen::Vector3d(m.at<double>(0, 0), m.at<double>(1, 0), m.at<double>(2, 0));
 }
 
+static cv::Point2d getPointDouble(const cv::Mat& m) {
+    cv::Mat m_double;
+    if (m.depth() != CV_64F) {
+        m.convertTo(m_double, CV_64F);
+    } else {
+        m_double = m;
+    }
+    return cv::Point2d(m_double.at<double>(0, 0), m_double.at<double>(0, 1));
+}
+
 std::vector<Ball3D> StereoTriangulator::triangulateShot(
     const std::vector<BallObservation>& leftObs,
     const std::vector<BallObservation>& rightObs
@@ -44,14 +54,14 @@ std::vector<Ball3D> StereoTriangulator::triangulateShot(
     for (std::size_t i = 0; i < leftObs.size(); ++i) {
         pt_temp_.at<cv::Vec2d>(0, 0) = cv::Vec2d(leftObs[i].centroid.x, leftObs[i].centroid.y);
         cv::undistortPoints(pt_temp_, und_temp_, calib_.K_L, calib_.D_L, calib_.R_L, calib_.P_L);
-        rectLeft[i] = cv::Point2d(und_temp_.at<double>(0, 0), und_temp_.at<double>(0, 1));
+        rectLeft[i] = getPointDouble(und_temp_);
     }
 
     std::vector<cv::Point2d> rectRight(rightObs.size());
     for (std::size_t j = 0; j < rightObs.size(); ++j) {
         pt_temp_.at<cv::Vec2d>(0, 0) = cv::Vec2d(rightObs[j].centroid.x, rightObs[j].centroid.y);
         cv::undistortPoints(pt_temp_, und_temp_, calib_.K_R, calib_.D_R, calib_.R_R, calib_.P_R);
-        rectRight[j] = cv::Point2d(und_temp_.at<double>(0, 0), und_temp_.at<double>(0, 1));
+        rectRight[j] = getPointDouble(und_temp_);
     }
 
     // 2. Sort indices horizontally (downrange along X) to preserve chronological path structure
@@ -139,7 +149,7 @@ std::vector<Ball3D> StereoTriangulator::triangulateShot(
             pt_temp_.create(1, 1, CV_64FC2);
             pt_temp_.at<cv::Vec2d>(0, 0) = cv::Vec2d(mr.position.x, mr.position.y);
             cv::undistortPoints(pt_temp_, und_temp_, calib_.K_R, calib_.D_R, calib_.R_R, calib_.P_R);
-            undMrList.push_back(cv::Point2d(und_temp_.at<double>(0, 0), und_temp_.at<double>(0, 1)));
+            undMrList.push_back(getPointDouble(und_temp_));
         }
 
         // Try to match Left markers with Right markers
@@ -147,7 +157,7 @@ std::vector<Ball3D> StereoTriangulator::triangulateShot(
             pt_temp_.create(1, 1, CV_64FC2);
             pt_temp_.at<cv::Vec2d>(0, 0) = cv::Vec2d(ml.position.x, ml.position.y);
             cv::undistortPoints(pt_temp_, und_temp_, calib_.K_L, calib_.D_L, calib_.R_L, calib_.P_L);
-            cv::Point2d undMl(und_temp_.at<double>(0, 0), und_temp_.at<double>(0, 1));
+            cv::Point2d undMl = getPointDouble(und_temp_);
 
             int bestMatchIndex = -1;
             double bestMatchDiffY = 3.0; // 3.0 pixels rectified y tolerance
@@ -189,8 +199,9 @@ std::vector<Ball3D> StereoTriangulator::triangulateShot(
                 pt_temp_.at<cv::Vec2d>(0, 0) = cv::Vec2d(ml.position.x, ml.position.y);
                 cv::undistortPoints(pt_temp_, und_temp_, calib_.K_L, calib_.D_L);
                 
-                double x_norm = und_temp_.at<double>(0, 0);
-                double y_norm = und_temp_.at<double>(0, 1);
+                cv::Point2d normL = getPointDouble(und_temp_);
+                double x_norm = normL.x;
+                double y_norm = normL.y;
                 
                 // Ray in Left camera frame (world frame)
                 Eigen::Vector3d rayDir(x_norm, y_norm, 1.0);
@@ -221,8 +232,9 @@ std::vector<Ball3D> StereoTriangulator::triangulateShot(
             pt_temp_.at<cv::Vec2d>(0, 0) = cv::Vec2d(mr.position.x, mr.position.y);
             cv::undistortPoints(pt_temp_, und_temp_, calib_.K_R, calib_.D_R);
 
-            double x_norm = und_temp_.at<double>(0, 0);
-            double y_norm = und_temp_.at<double>(0, 1);
+            cv::Point2d normR = getPointDouble(und_temp_);
+            double x_norm = normR.x;
+            double y_norm = normR.y;
 
             // Ray in Right camera frame
             Eigen::Vector3d rayCamR(x_norm, y_norm, 1.0);
