@@ -23,5 +23,6 @@ public:
     );
 
     bool checkOpticalGate(const cv::Mat& currentFrame) override;
+    void reset() override;
 };
 

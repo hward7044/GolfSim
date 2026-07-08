@@ -29,6 +29,7 @@
 template<typename T>
 concept CTriggerDetector = requires(T t, const cv::Mat& f) {
     { t.checkOpticalGate(f) } -> std::same_as<bool>;
+    t.reset();
 };
 
 template<typename T>
@@ -140,9 +141,9 @@ public:
             }
 
             // 3. Option C Completion Check:
-            //    - emptyFrameCount >= 5 (ball has left the frame) OR
+            //    - emptyFrameCount >= 15 (ball has left the frame) OR
             //    - trajectoryBuffer.size() >= 25 (safety cutoff)
-            if (emptyFrameCount >= 5 || trajectoryBuffer.size() >= 25) {
+            if (emptyFrameCount >= 15 || trajectoryBuffer.size() >= 25) {
                 spdlog::info("[SessionStateMachine] Shot capture completed. Buffered points: {}, Empty frames: {}", 
                              trajectoryBuffer.size(), emptyFrameCount);
 
@@ -172,6 +173,7 @@ public:
                 inShot = false;
                 trajectoryBuffer.clear();
                 emptyFrameCount = 0;
+                trigger.reset();
             }
         }
     }

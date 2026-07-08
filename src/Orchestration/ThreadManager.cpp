@@ -39,6 +39,9 @@ void ThreadManager::startProducerThread() {
         // Optical gate trigger helper for idle detection
         OpticalGateTrigger gateTrigger;
 
+        // Cooldown timer to prevent rapid double-triggering
+        auto lastTriggerTime = std::chrono::steady_clock::now() - std::chrono::seconds(5);
+
         while (!stopToken.stop_requested() && running_) {
             if (!cameraSystem) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -56,12 +59,17 @@ void ThreadManager::startProducerThread() {
                 cv::Mat leftFrame = frameSet.getFrame(CameraRole::STEREO_LEFT);
                 if (!leftFrame.empty()) {
                     if (gateTrigger.checkOpticalGate(leftFrame)) {
-                        spdlog::info("[ThreadManager] Optical gate triggered! Dispatching MCU serial FIRE signal.");
+                        auto now = std::chrono::steady_clock::now();
+                        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastTriggerTime).count() >= 2) {
+                            spdlog::info("[ThreadManager] Optical gate triggered! Dispatching MCU serial FIRE signal.");
 #ifdef _WIN32
-                        if (serial_.isOpen()) {
-                            serial_.writeString("FIRE\n");
-                        }
+                            if (serial_.isOpen()) {
+                                serial_.writeString("FIRE\n");
+                            }
 #endif
+                            lastTriggerTime = now;
+                            gateTrigger.reset();
+                        }
                     }
                 }
             } else {
