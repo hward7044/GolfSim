@@ -30,6 +30,9 @@ public:
         double minBCirc = 0.6
     );
 
-    std::vector<BallObservation> detectBalls(const cv::Mat& frame) override;
+    std::vector<BallObservation> detectBalls(const cv::Mat& frame) override {
+        return detectBalls(frame, nullptr);
+    }
+    std::vector<BallObservation> detectBalls(const cv::Mat& frame, VisionDiagnostics* diag) override;
 };
 

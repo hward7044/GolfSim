@@ -55,7 +55,7 @@ std::vector<MarkerObservation> OpenCVMomentsTracker::extractMarkersInROI(
     return markers;
 }
 
-std::vector<BallObservation> OpenCVMomentsTracker::detectBalls(const cv::Mat& frame) {
+std::vector<BallObservation> OpenCVMomentsTracker::detectBalls(const cv::Mat& frame, VisionDiagnostics* diag) {
     std::vector<BallObservation> ballObservations;
     if (frame.empty()) {
         return ballObservations;
@@ -79,7 +79,21 @@ std::vector<BallObservation> OpenCVMomentsTracker::detectBalls(const cv::Mat& fr
 
     for (const auto& contour : contours) {
         double area = cv::contourArea(contour);
+        cv::Rect boundRect = cv::boundingRect(contour);
+        cv::Point2d centroid(boundRect.x + boundRect.width / 2.0, boundRect.y + boundRect.height / 2.0);
+
         if (area < minBallArea_ || area > maxBallArea_) {
+            if (diag) {
+                VisionDiagnostics::Candidate cand;
+                cand.centroid = centroid;
+                cand.boundingBox = boundRect;
+                cand.area = area;
+                cand.circularity = 0.0;
+                cand.isOverlapping = false;
+                cand.accepted = false;
+                cand.reason = area < minBallArea_ ? "Area too small" : "Area too large";
+                diag->candidates.push_back(cand);
+            }
             continue;
         }
 
@@ -93,53 +107,108 @@ std::vector<BallObservation> OpenCVMomentsTracker::detectBalls(const cv::Mat& fr
         bool isOverlapping = (area > 1.5 * minBallArea_ && circularity < minBallCircularity_);
 
         if (isOverlapping) {
-            cv::Rect boundRect = cv::boundingRect(contour);
             // Pad slightly
-            boundRect.x = std::max(0, boundRect.x - 10);
-            boundRect.y = std::max(0, boundRect.y - 10);
-            boundRect.width = std::min(gray_.cols - boundRect.x, boundRect.width + 20);
-            boundRect.height = std::min(gray_.rows - boundRect.y, boundRect.height + 20);
+            cv::Rect searchRect = boundRect;
+            searchRect.x = std::max(0, searchRect.x - 10);
+            searchRect.y = std::max(0, searchRect.y - 10);
+            searchRect.width = std::min(gray_.cols - searchRect.x, searchRect.width + 20);
+            searchRect.height = std::min(gray_.rows - searchRect.y, searchRect.height + 20);
 
-            localRegion_ = gray_(boundRect);
+            localRegion_ = gray_(searchRect);
             
             // Reduce high-frequency noise before Hough Circle transform
             cv::GaussianBlur(localRegion_, localRegionBlurred_, cv::Size(3, 3), 0.5);
             
             // Hough Circle Transform to isolate overlapping circles
             std::vector<cv::Vec3f> circles;
-            // Expected ball radius in pixels (approx 15 to 50 pixels)
-            // Use param2 = 35.0 (up from 20.0) to reduce false positives
             cv::HoughCircles(localRegionBlurred_, circles, cv::HOUGH_GRADIENT, 1.0, 15.0, 50.0, 35.0, 12, 55);
 
-            for (const auto& c : circles) {
-                cv::Point2d globalCentroid(boundRect.x + c[0], boundRect.y + c[1]);
-                double radius = c[2];
-                cv::Rect ballRoi(
-                    static_cast<int>(globalCentroid.x - radius),
-                    static_cast<int>(globalCentroid.y - radius),
-                    static_cast<int>(2 * radius),
-                    static_cast<int>(2 * radius)
-                );
+            if (circles.empty()) {
+                if (diag) {
+                    VisionDiagnostics::Candidate cand;
+                    cand.centroid = centroid;
+                    cand.boundingBox = boundRect;
+                    cand.area = area;
+                    cand.circularity = circularity;
+                    cand.isOverlapping = true;
+                    cand.accepted = false;
+                    cand.reason = "Overlapping contour: no Hough circles found";
+                    diag->candidates.push_back(cand);
+                }
+            } else {
+                for (const auto& c : circles) {
+                    cv::Point2d globalCentroid(searchRect.x + c[0], searchRect.y + c[1]);
+                    double radius = c[2];
+                    cv::Rect ballRoi(
+                        static_cast<int>(globalCentroid.x - radius),
+                        static_cast<int>(globalCentroid.y - radius),
+                        static_cast<int>(2 * radius),
+                        static_cast<int>(2 * radius)
+                    );
+                    cv::Rect clippedRoi = ballRoi & cv::Rect(0, 0, gray_.cols, gray_.rows);
 
-                BallObservation obs;
-                obs.centroid = globalCentroid;
-                obs.boundingBox = ballRoi & cv::Rect(0, 0, gray_.cols, gray_.rows);
-                obs.markers = extractMarkersInROI(gray_, obs.boundingBox, markerThreshold_);
-                ballObservations.push_back(obs);
+                    BallObservation obs;
+                    obs.centroid = globalCentroid;
+                    obs.boundingBox = clippedRoi;
+                    obs.markers = extractMarkersInROI(gray_, obs.boundingBox, markerThreshold_);
+                    ballObservations.push_back(obs);
+
+                    if (diag) {
+                        VisionDiagnostics::Candidate cand;
+                        cand.centroid = globalCentroid;
+                        cand.boundingBox = clippedRoi;
+                        cand.area = area;
+                        cand.circularity = circularity;
+                        cand.isOverlapping = true;
+                        cand.accepted = true;
+                        cand.reason = "Accepted (Hough Circle)";
+                        for (const auto& m : obs.markers) {
+                            cand.markers.push_back(m.position);
+                        }
+                        diag->candidates.push_back(cand);
+                    }
+                }
             }
         } else {
             // Process contour. Even if circularity is slightly below threshold, we still fallback to 
             // moments centroid tracking instead of silently discarding it.
             cv::Moments m = cv::moments(contour);
             if (m.m00 > 0.0) {
-                cv::Point2d centroid(m.m10 / m.m00, m.m01 / m.m00);
+                cv::Point2d momentsCentroid(m.m10 / m.m00, m.m01 / m.m00);
                 cv::Rect boundRect = cv::boundingRect(contour);
 
                 BallObservation obs;
-                obs.centroid = centroid;
+                obs.centroid = momentsCentroid;
                 obs.boundingBox = boundRect;
                 obs.markers = extractMarkersInROI(gray_, boundRect, markerThreshold_);
                 ballObservations.push_back(obs);
+
+                if (diag) {
+                    VisionDiagnostics::Candidate cand;
+                    cand.centroid = momentsCentroid;
+                    cand.boundingBox = boundRect;
+                    cand.area = area;
+                    cand.circularity = circularity;
+                    cand.isOverlapping = false;
+                    cand.accepted = true;
+                    cand.reason = "Accepted (Moments)";
+                    for (const auto& m : obs.markers) {
+                        cand.markers.push_back(m.position);
+                    }
+                    diag->candidates.push_back(cand);
+                }
+            } else {
+                if (diag) {
+                    VisionDiagnostics::Candidate cand;
+                    cand.centroid = centroid;
+                    cand.boundingBox = boundRect;
+                    cand.area = area;
+                    cand.circularity = circularity;
+                    cand.isOverlapping = false;
+                    cand.accepted = false;
+                    cand.reason = "Moments calculation failed (m00 == 0)";
+                    diag->candidates.push_back(cand);
+                }
             }
         }
     }

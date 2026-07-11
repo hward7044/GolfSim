@@ -63,6 +63,7 @@ private:
 
     // Track state across incoming frames
     std::vector<Ball3D> trajectoryBuffer;
+    std::vector<RecordedFrame> recordedFrames;
     int            emptyFrameCount = 0;
     bool           inShot = false;
 
@@ -112,23 +113,31 @@ public:
             return;
         }
 
+        TriggerDiagnostics trigDiag;
+        bool triggeredNow = false;
+
         // 1. If not currently in a shot, monitor the optical gate for trigger event
         if (!inShot) {
-            if (trigger.checkOpticalGate(leftFrame)) {
+            if (trigger.checkOpticalGate(leftFrame, &trigDiag)) {
                 inShot = true;
                 trajectoryBuffer.clear();
+                recordedFrames.clear();
                 emptyFrameCount = 0;
+                triggeredNow = true;
                 spdlog::info("[SessionStateMachine] Optical gate triggered! Starting shot capture...");
             }
         }
 
         // 2. If swing is triggered, detect and triangulate coordinates
         if (inShot) {
-            auto leftBalls = vision.detectBalls(leftFrame);
-            auto rightBalls = vision.detectBalls(rightFrame);
+            VisionDiagnostics leftVisionDiag;
+            VisionDiagnostics rightVisionDiag;
+            auto leftBalls = vision.detectBalls(leftFrame, &leftVisionDiag);
+            auto rightBalls = vision.detectBalls(rightFrame, &rightVisionDiag);
 
+            std::vector<Ball3D> triangulated;
             if (!leftBalls.empty() || !rightBalls.empty()) {
-                std::vector<Ball3D> triangulated = spatial.triangulateShot(leftBalls, rightBalls);
+                triangulated = spatial.triangulateShot(leftBalls, rightBalls);
 
                 if (!triangulated.empty()) {
                     trajectoryBuffer.insert(trajectoryBuffer.end(), triangulated.begin(), triangulated.end());
@@ -139,6 +148,17 @@ public:
             } else {
                 emptyFrameCount++;
             }
+
+            // Buffer the recorded frame (clone frames to avoid sharing references/buffers)
+            RecordedFrame rf;
+            rf.timestamp = set.timestamp;
+            rf.leftFrame = leftFrame.clone();
+            rf.rightFrame = rightFrame.clone();
+            rf.triggerDiag = trigDiag; // contains valid trigger info if triggered on this frame, otherwise default
+            rf.leftVisionDiag = leftVisionDiag;
+            rf.rightVisionDiag = rightVisionDiag;
+            rf.triangulatedBalls = triangulated;
+            recordedFrames.push_back(rf);
 
             // 3. Option C Completion Check:
             //    - emptyFrameCount >= 15 (ball has left the frame) OR
@@ -162,8 +182,8 @@ public:
                     // Save shot parameters to file
                     saveToShotHistory(launchData);
 
-                    // Save raw data to FlightRecorder
-                    recorder.saveSession(trajectoryBuffer);
+                    // Save raw and annotated data to FlightRecorder
+                    recorder.saveSession(recordedFrames, launchData);
                 } else {
                     spdlog::warn("[SessionStateMachine] Trajectory buffer has insufficient points ({}) to solve. Shot discarded.", 
                                  trajectoryBuffer.size());
@@ -172,6 +192,7 @@ public:
                 // Reset state parameters
                 inShot = false;
                 trajectoryBuffer.clear();
+                recordedFrames.clear();
                 emptyFrameCount = 0;
                 trigger.reset();
             }

@@ -22,7 +22,10 @@ public:
         double alphaVal = 0.005
     );
 
-    bool checkOpticalGate(const cv::Mat& currentFrame) override;
+    bool checkOpticalGate(const cv::Mat& currentFrame) override {
+        return checkOpticalGate(currentFrame, nullptr);
+    }
+    bool checkOpticalGate(const cv::Mat& currentFrame, TriggerDiagnostics* diag) override;
     void reset() override;
 };
 

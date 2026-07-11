@@ -1,18 +1,33 @@
 #pragma once
 #include <string>
-#include <ranges>
+#include <vector>
+#include <opencv2/opencv.hpp>
 #include "Camera/FrameSet.hpp"
+#include "Math/ITriggerDetector.hpp"
+#include "Math/IComputerVision.hpp"
+#include "Math/ISpatialSolver.hpp"
+#include "Math/LaunchData.hpp"
+#include "Math/Units.hpp"
+
+struct RecordedFrame {
+    uint64_t timestamp = 0;
+    cv::Mat leftFrame;
+    cv::Mat rightFrame;
+    TriggerDiagnostics triggerDiag;
+    VisionDiagnostics leftVisionDiag;
+    VisionDiagnostics rightVisionDiag;
+    std::vector<Ball3D> triangulatedBalls;
+};
+
 class FlightRecorder {
 private:
     std::string outputDirectory;
+    void enforceLimit();
 public:
-    // T.3 — express containers & ranges
-    // template<typename FrameRange>
-    //   requires std::ranges::range<FrameRange>
-    // Accepts span, deque, ring-buffer view, etc.
-    template<typename FrameRange>
-        requires std::ranges::range<FrameRange>
-    void saveSession(FrameRange&& frames) {
-        // Stub: save frames to outputDirectory
-    }
+    FlightRecorder(const std::string& outDir = "build/replays");
+
+    void saveSession(
+        const std::vector<RecordedFrame>& frames,
+        const LaunchData<Degrees, MilesPerHour>& launchData
+    );
 };

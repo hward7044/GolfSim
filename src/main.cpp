@@ -37,11 +37,24 @@
 #include "Orchestration/ThreadManager.hpp"
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 
 const bool RUN_DEBUG_VIEWER = false;
 void runCameraDebugViewer();
 
-int main() {
+void runReplayViewer(const std::string& replayDir);
+
+int main(int argc, char* argv[]) {
+    // Parse replay argument if provided: --replay <dir> or -r <dir>
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if ((arg == "--replay" || arg == "-r") && i + 1 < argc) {
+            runReplayViewer(argv[i + 1]);
+            return 0;
+        }
+    }
     // Determine compiler-specific C++ standard version
     long cpp_version = __cplusplus;
 #ifdef _MSVC_LANG
@@ -357,4 +370,131 @@ void runCameraDebugViewer() {
     cv::destroyAllWindows();
     cameraSystem.shutdown();
     std::cout << "Shutdown completed cleanly." << std::endl;
+}
+
+void runReplayViewer(const std::string& replayDir) {
+    namespace fs = std::filesystem;
+    fs::path dir(replayDir);
+    if (!fs::exists(dir) || !fs::is_directory(dir)) {
+        std::cerr << "Error: Replay directory does not exist: " << replayDir << std::endl;
+        return;
+    }
+
+    fs::path metaPath = dir / "metadata.json";
+    if (!fs::exists(metaPath)) {
+        std::cerr << "Error: metadata.json not found in " << replayDir << std::endl;
+        return;
+    }
+
+    nlohmann::json meta;
+    try {
+        std::ifstream in(metaPath.string());
+        if (!in.is_open()) throw std::runtime_error("Could not open file");
+        in >> meta;
+    } catch (const std::exception& e) {
+        std::cerr << "Error parsing metadata.json: " << e.what() << std::endl;
+        return;
+    }
+
+    std::string shotId = meta.value("shotId", "unknown");
+    std::cout << "============================================" << std::endl;
+    std::cout << "Loading Shot Replay: " << shotId << std::endl;
+    if (meta.contains("kinematics")) {
+        auto k = meta["kinematics"];
+        std::cout << "Kinematics Solved:" << std::endl;
+        std::cout << "  - Speed: " << k.value("ballSpeed_mph", 0.0) << " mph" << std::endl;
+        std::cout << "  - VLA: " << k.value("verticalLaunchAngle_deg", 0.0) << " deg" << std::endl;
+        std::cout << "  - HLA: " << k.value("horizontalLaunchAngle_deg", 0.0) << " deg" << std::endl;
+        std::cout << "  - Spin: " << k.value("spinRPM", 0.0) << " RPM" << std::endl;
+    }
+    std::cout << "============================================" << std::endl;
+    std::cout << "Controls:" << std::endl;
+    std::cout << "  - SPACE : Pause / Play auto-playback" << std::endl;
+    std::cout << "  - d / Arrow Right : Step forward 1 frame" << std::endl;
+    std::cout << "  - a / Arrow Left  : Step backward 1 frame" << std::endl;
+    std::cout << "  - 'o'   : Toggle diagnostic overlays ON/OFF" << std::endl;
+    std::cout << "  - ESC   : Exit Replay Viewer" << std::endl;
+
+    auto framesJson = meta["frames"];
+    size_t frameCount = framesJson.size();
+    if (frameCount == 0) {
+        std::cerr << "Replay contains zero frames!" << std::endl;
+        return;
+    }
+
+    std::string windowName = "GolfSim Interactive Shot Replay - " + shotId;
+    cv::namedWindow(windowName, cv::WINDOW_AUTOSIZE);
+
+    size_t currentIndex = 0;
+    bool playing = false;
+    bool showOverlays = true;
+
+    while (true) {
+        std::ostringstream nameOss;
+        nameOss << std::setw(3) << std::setfill('0') << currentIndex << ".png";
+        std::string filename = nameOss.str();
+
+        cv::Mat leftImg, rightImg;
+        if (showOverlays) {
+            leftImg = cv::imread((dir / "annotated" / ("left_" + filename)).string());
+            rightImg = cv::imread((dir / "annotated" / ("right_" + filename)).string());
+        } else {
+            leftImg = cv::imread((dir / "raw" / ("left_" + filename)).string());
+            rightImg = cv::imread((dir / "raw" / ("right_" + filename)).string());
+            if (!leftImg.empty() && leftImg.channels() == 1) {
+                cv::cvtColor(leftImg, leftImg, cv::COLOR_GRAY2BGR);
+            }
+            if (!rightImg.empty() && rightImg.channels() == 1) {
+                cv::cvtColor(rightImg, rightImg, cv::COLOR_GRAY2BGR);
+            }
+        }
+
+        if (leftImg.empty() && rightImg.empty()) {
+            std::cerr << "\nFailed to load frame " << currentIndex << std::endl;
+            break;
+        }
+
+        cv::Mat displayLeft, displayRight;
+        if (!leftImg.empty()) {
+            cv::resize(leftImg, displayLeft, cv::Size(640, 400));
+        } else {
+            displayLeft = cv::Mat::zeros(400, 640, CV_8UC3);
+        }
+
+        if (!rightImg.empty()) {
+            cv::resize(rightImg, displayRight, cv::Size(640, 400));
+        } else {
+            displayRight = cv::Mat::zeros(400, 640, CV_8UC3);
+        }
+
+        cv::Mat composite;
+        cv::hconcat(displayLeft, displayRight, composite);
+
+        std::string statusText = "Frame " + std::to_string(currentIndex + 1) + " / " + std::to_string(frameCount) +
+                                 " | " + (playing ? "PLAYING" : "PAUSED") +
+                                 " | Overlays: " + (showOverlays ? "ON" : "OFF");
+        cv::rectangle(composite, cv::Rect(5, 5, 450, 30), cv::Scalar(0, 0, 0), -1);
+        cv::putText(composite, statusText, cv::Point(15, 25), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+
+        cv::imshow(windowName, composite);
+
+        int waitTime = playing ? 100 : 0;
+        int key = cv::waitKey(waitTime);
+
+        if (key == 27) { // ESC
+            break;
+        } else if (key == ' ') {
+            playing = !playing;
+        } else if (key == 'o' || key == 'O') {
+            showOverlays = !showOverlays;
+        } else if (key == 'd' || key == 'D' || key == 2424832 || key == 65363 || key == 79) { // right
+            currentIndex = (currentIndex + 1) % frameCount;
+        } else if (key == 'a' || key == 'A' || key == 2424830 || key == 65361 || key == 80) { // left
+            currentIndex = (currentIndex + frameCount - 1) % frameCount;
+        } else if (playing) {
+            currentIndex = (currentIndex + 1) % frameCount;
+        }
+    }
+
+    cv::destroyWindow(windowName);
 }

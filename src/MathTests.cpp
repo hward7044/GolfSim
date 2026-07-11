@@ -3,13 +3,15 @@
 #include "Math/OpenCVMomentsTracker.hpp"
 #include "Math/StereoTriangulator.hpp"
 #include "Math/EigenBallisticsEngine.hpp"
+#include "Diagnostics/FlightRecorder.hpp"
 #include <Eigen/Geometry>
 #include <spdlog/spdlog.h>
 #include <cassert>
 #include <cmath>
 #include <vector>
 #include <iostream>
-
+#include <filesystem>
+#include <thread>
 #include <numbers>
 
 
@@ -48,8 +50,14 @@ void testOpticalGateTrigger() {
     // Frame 3: Draw a bright square inside the ROI (representing a ball)
     cv::Mat frame3 = cv::Mat::zeros(100, 100, CV_8UC1);
     cv::rectangle(frame3, cv::Rect(20, 20, 20, 20), cv::Scalar(255), -1); // 400 white pixels
-    bool trig3 = trigger.checkOpticalGate(frame3);
+    TriggerDiagnostics diag;
+    bool trig3 = trigger.checkOpticalGate(frame3, &diag);
     assert(trig3); // Should trigger (400 > 100 min pixels)
+    assert(diag.triggered == trig3);
+    assert(diag.nonZeroCount > 0);
+    assert(diag.minBallPixels == 100);
+    assert(diag.pixelDiffThreshold == 15);
+    assert(diag.gateROI.width == 50);
 
     spdlog::info("[TEST] OpticalGateTrigger verification passed.");
 }
@@ -62,14 +70,37 @@ void testOpenCVMomentsTracker() {
     cv::Point center(200, 200);
     cv::circle(frame, center, 15, cv::Scalar(100), -1); // Ball silhouette (diffuse intensity 100)
     cv::circle(frame, cv::Point(205, 195), 2, cv::Scalar(255), -1); // Marker glint (intensity 255)
+    
+    // Draw a small noise spot that will be rejected due to area < 50
+    cv::circle(frame, cv::Point(20, 20), 1, cv::Scalar(100), -1);
 
-    auto balls = tracker.detectBalls(frame);
+    VisionDiagnostics vdiag;
+    auto balls = tracker.detectBalls(frame, &vdiag);
     assert(balls.size() == 1);
     assert(std::abs(balls[0].centroid.x - 200) < 1.0);
     assert(std::abs(balls[0].centroid.y - 200) < 1.0);
     assert(balls[0].markers.size() == 1);
     assert(std::abs(balls[0].markers[0].position.x - 205) < 1.0);
     assert(std::abs(balls[0].markers[0].position.y - 195) < 1.0);
+
+    // Verify diagnostics
+    assert(vdiag.candidates.size() >= 2);
+    bool foundBall = false;
+    bool foundNoise = false;
+    for (const auto& cand : vdiag.candidates) {
+        if (cand.accepted) {
+            assert(std::abs(cand.centroid.x - 200) < 1.0);
+            assert(cand.reason == "Accepted (Moments)");
+            assert(cand.markers.size() == 1);
+            assert(std::abs(cand.markers[0].x - 205) < 1.0);
+            foundBall = true;
+        } else {
+            assert(cand.reason == "Area too small");
+            foundNoise = true;
+        }
+    }
+    assert(foundBall);
+    assert(foundNoise);
 
     spdlog::info("[TEST] OpenCVMomentsTracker verification passed.");
 }
@@ -214,6 +245,71 @@ void testKinematicsEngine() {
     spdlog::info("[TEST] EigenBallisticsEngine verification passed.");
 }
 
+void testFlightRecorder() {
+    FlightRecorder recorder("build/replays_test");
+
+    // Clean up test dir if it exists
+    std::filesystem::remove_all("build/replays_test");
+
+    std::vector<RecordedFrame> frames;
+    for (int i = 0; i < 12; ++i) {
+        RecordedFrame f;
+        f.timestamp = i * 1000;
+        f.leftFrame = cv::Mat::zeros(100, 100, CV_8UC1);
+        f.rightFrame = cv::Mat::zeros(100, 100, CV_8UC1);
+        f.triggerDiag.nonZeroCount = 10;
+        f.triggerDiag.minBallPixels = 100;
+        f.triggerDiag.pixelDiffThreshold = 20;
+        f.triggerDiag.triggered = false;
+        f.triggerDiag.gateROI = cv::Rect(10, 10, 50, 50);
+
+        VisionDiagnostics::Candidate cand;
+        cand.centroid = cv::Point2d(50, 50);
+        cand.boundingBox = cv::Rect(40, 40, 20, 20);
+        cand.area = 400.0;
+        cand.circularity = 1.0;
+        cand.isOverlapping = false;
+        cand.accepted = true;
+        cand.reason = "Accepted (Moments)";
+        cand.markers.push_back(cv::Point2d(45, 45));
+        f.leftVisionDiag.candidates.push_back(cand);
+        f.rightVisionDiag.candidates.push_back(cand);
+
+        frames.push_back(f);
+    }
+
+    LaunchData<Degrees, MilesPerHour> launchData;
+    launchData.ballSpeed = MilesPerHour(100.0);
+    launchData.verticalLaunchAngle = Degrees(15.0);
+    launchData.horizontalLaunchAngle = Degrees(2.0);
+    launchData.spinRPM = 3000.0;
+    launchData.spinAxis = Eigen::Vector3d(0, 0, -1);
+
+    // Let's call saveSession 12 times to trigger limit rotation (which caps at 10)
+    for (int i = 0; i < 12; ++i) {
+        recorder.saveSession(frames, launchData);
+        // sleep a tiny bit to ensure distinct ms timestamps
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    // Check that we have exactly 10 directories in build/replays_test starting with shot_
+    int count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator("build/replays_test")) {
+        if (entry.is_directory() && entry.path().filename().string().rfind("shot_", 0) == 0) {
+            count++;
+            // Check that subdirectories raw/ and annotated/ and metadata.json exist
+            assert(std::filesystem::exists(entry.path() / "raw"));
+            assert(std::filesystem::exists(entry.path() / "annotated"));
+            assert(std::filesystem::exists(entry.path() / "metadata.json"));
+        }
+    }
+    assert(count == 10);
+
+    // Clean up
+    std::filesystem::remove_all("build/replays_test");
+    spdlog::info("[TEST] FlightRecorder verification passed.");
+}
+
 void runMathTests() {
     spdlog::info("============================================");
     spdlog::info("Starting C++ Math Verification Tests...");
@@ -224,6 +320,7 @@ void runMathTests() {
     testOpenCVMomentsTracker();
     testStereoTriangulatorAndRaySphere();
     testKinematicsEngine();
+    testFlightRecorder();
 
     spdlog::info("============================================");
     spdlog::info("All C++ Math Verification Tests PASSED!");
