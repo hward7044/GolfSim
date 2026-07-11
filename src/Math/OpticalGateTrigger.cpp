@@ -1,9 +1,18 @@
 #include "Math/OpticalGateTrigger.hpp"
+#include <opencv2/imgproc.hpp>
 
 OpticalGateTrigger::OpticalGateTrigger(cv::Rect roi, int minPixels, int threshold, double alphaVal)
-    : gateROI(roi), minBallPixels(minPixels), pixelDiffThreshold(threshold), alpha(alphaVal) {}
+    : gateROI(roi), minBallPixels(minPixels), pixelDiffThreshold(threshold), alpha(alphaVal) {
+    latestDiag = {
+        {"triggered", false},
+        {"nonZeroCount", 0},
+        {"minBallPixels", minBallPixels},
+        {"pixelDiffThreshold", pixelDiffThreshold},
+        {"gateROI", {gateROI.x, gateROI.y, gateROI.width, gateROI.height}}
+    };
+}
 
-bool OpticalGateTrigger::checkOpticalGate(const cv::Mat& currentFrame, TriggerDiagnostics* diag) {
+bool OpticalGateTrigger::checkOpticalGate(const cv::Mat& currentFrame) {
     if (currentFrame.empty()) {
         return false;
     }
@@ -33,13 +42,13 @@ bool OpticalGateTrigger::checkOpticalGate(const cv::Mat& currentFrame, TriggerDi
     if (backgroundRef.empty() || backgroundRef.size() != roi.size()) {
         blurredRoi.convertTo(backgroundRef, CV_32FC1);
         backgroundRef.convertTo(backgroundRef8U, CV_8UC1);
-        if (diag) {
-            diag->triggered = false;
-            diag->nonZeroCount = 0;
-            diag->minBallPixels = minBallPixels;
-            diag->pixelDiffThreshold = pixelDiffThreshold;
-            diag->gateROI = roi;
-        }
+        latestDiag = {
+            {"triggered", false},
+            {"nonZeroCount", 0},
+            {"minBallPixels", minBallPixels},
+            {"pixelDiffThreshold", pixelDiffThreshold},
+            {"gateROI", {roi.x, roi.y, roi.width, roi.height}}
+        };
         return false;
     }
 
@@ -70,13 +79,13 @@ bool OpticalGateTrigger::checkOpticalGate(const cv::Mat& currentFrame, TriggerDi
     int nonZeroCount = cv::countNonZero(thresh);
     bool triggered = (nonZeroCount >= minBallPixels);
 
-    if (diag) {
-        diag->triggered = triggered;
-        diag->nonZeroCount = nonZeroCount;
-        diag->minBallPixels = minBallPixels;
-        diag->pixelDiffThreshold = pixelDiffThreshold;
-        diag->gateROI = roi;
-    }
+    latestDiag = {
+        {"triggered", triggered},
+        {"nonZeroCount", nonZeroCount},
+        {"minBallPixels", minBallPixels},
+        {"pixelDiffThreshold", pixelDiffThreshold},
+        {"gateROI", {roi.x, roi.y, roi.width, roi.height}}
+    };
 
     // Update background reference using EMA for static pixels
     // Use the uncorrected blurred frame to track actual slow light drift
@@ -93,4 +102,11 @@ bool OpticalGateTrigger::checkOpticalGate(const cv::Mat& currentFrame, TriggerDi
 void OpticalGateTrigger::reset() {
     backgroundRef.release();
     backgroundRef8U.release();
+    latestDiag = {
+        {"triggered", false},
+        {"nonZeroCount", 0},
+        {"minBallPixels", minBallPixels},
+        {"pixelDiffThreshold", pixelDiffThreshold},
+        {"gateROI", {gateROI.x, gateROI.y, gateROI.width, gateROI.height}}
+    };
 }

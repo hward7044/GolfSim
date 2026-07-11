@@ -7,15 +7,47 @@
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
 
 namespace fs = std::filesystem;
 
 FlightRecorder::FlightRecorder(const std::string& outDir)
-    : outputDirectory(outDir) {
+    : outputDirectory(outDir), stopWorker(false) {
     try {
         fs::create_directories(outputDirectory);
     } catch (const std::exception& e) {
         spdlog::error("[FlightRecorder] Failed to create output directory {}: {}", outputDirectory, e.what());
+    }
+    workerThread = std::thread(&FlightRecorder::workerLoop, this);
+}
+
+FlightRecorder::~FlightRecorder() {
+    stopWorker = true;
+    cvQueue.notify_all();
+    if (workerThread.joinable()) {
+        workerThread.join();
+    }
+}
+
+void FlightRecorder::workerLoop() {
+    while (true) {
+        SaveTask task;
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            cvQueue.wait(lock, [this]() {
+                return stopWorker || !taskQueue.empty();
+            });
+
+            if (stopWorker && taskQueue.empty()) {
+                break;
+            }
+
+            task = std::move(taskQueue.front());
+            taskQueue.pop();
+        }
+
+        processSaveTask(task);
     }
 }
 
@@ -31,7 +63,6 @@ void FlightRecorder::enforceLimit() {
             }
         }
 
-        // Lexicographical sort on shot_YYYYMMDD_HHMMSS_mmm naturally sorts chronologically
         std::sort(replays.begin(), replays.end());
 
         while (replays.size() > 10) {
@@ -54,7 +85,31 @@ void FlightRecorder::saveSession(
         return;
     }
 
-    // 1. Generate unique shot ID based on time
+    // Prepare and clone task data in the consumer thread to decouple from state machine pool reuse
+    SaveTask task;
+    task.launchData = launchData;
+    task.frames.reserve(frames.size());
+
+    for (const auto& f : frames) {
+        RecordedFrame clonedFrame;
+        clonedFrame.timestamp = f.timestamp;
+        clonedFrame.leftFrame = f.leftFrame.clone();   // Deep copy
+        clonedFrame.rightFrame = f.rightFrame.clone(); // Deep copy
+        clonedFrame.triggerDiag = f.triggerDiag;
+        clonedFrame.leftVisionDiag = f.leftVisionDiag;
+        clonedFrame.rightVisionDiag = f.rightVisionDiag;
+        clonedFrame.triangulatedBalls = f.triangulatedBalls;
+        task.frames.push_back(clonedFrame);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        taskQueue.push(task);
+    }
+    cvQueue.notify_one();
+}
+
+void FlightRecorder::processSaveTask(const SaveTask& task) {
     auto now = std::chrono::system_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
     auto timer = std::chrono::system_clock::to_time_t(now);
@@ -86,18 +141,17 @@ void FlightRecorder::saveSession(
     
     // Kinematics details
     jMeta["kinematics"] = {
-        {"ballSpeed_mph", launchData.ballSpeed.value()},
-        {"verticalLaunchAngle_deg", launchData.verticalLaunchAngle.value()},
-        {"horizontalLaunchAngle_deg", launchData.horizontalLaunchAngle.value()},
-        {"spinRPM", launchData.spinRPM},
-        {"spinAxis", {launchData.spinAxis.x(), launchData.spinAxis.y(), launchData.spinAxis.z()}}
+        {"ballSpeed_mph", task.launchData.ballSpeed.value()},
+        {"verticalLaunchAngle_deg", task.launchData.verticalLaunchAngle.value()},
+        {"horizontalLaunchAngle_deg", task.launchData.horizontalLaunchAngle.value()},
+        {"spinRPM", task.launchData.spinRPM},
+        {"spinAxis", {task.launchData.spinAxis.x(), task.launchData.spinAxis.y(), task.launchData.spinAxis.z()}}
     };
 
     nlohmann::json jFrames = nlohmann::json::array();
 
-    // 2. Loop through frames and write
-    for (size_t i = 0; i < frames.size(); ++i) {
-        const auto& rFrame = frames[i];
+    for (size_t i = 0; i < task.frames.size(); ++i) {
+        const auto& rFrame = task.frames[i];
         std::ostringstream nameOss;
         nameOss << std::setw(3) << std::setfill('0') << i << ".png";
         std::string filename = nameOss.str();
@@ -115,33 +169,53 @@ void FlightRecorder::saveSession(
         if (!rFrame.leftFrame.empty()) {
             cv::cvtColor(rFrame.leftFrame, annLeft, cv::COLOR_GRAY2BGR);
             
-            // Draw trigger box
-            cv::rectangle(annLeft, rFrame.triggerDiag.gateROI, cv::Scalar(0, 165, 255), 2);
-            std::string triggerText = "Gate Pixels: " + std::to_string(rFrame.triggerDiag.nonZeroCount) +
-                                      " / " + std::to_string(rFrame.triggerDiag.minBallPixels);
-            cv::putText(annLeft, triggerText, cv::Point(rFrame.triggerDiag.gateROI.x, rFrame.triggerDiag.gateROI.y - 10),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 165, 255), 1);
+            // Draw trigger box if data is valid
+            if (rFrame.triggerDiag.contains("gateROI")) {
+                auto roiJ = rFrame.triggerDiag["gateROI"];
+                if (roiJ.is_array() && roiJ.size() == 4) {
+                    cv::Rect roi(roiJ[0], roiJ[1], roiJ[2], roiJ[3]);
+                    cv::rectangle(annLeft, roi, cv::Scalar(0, 165, 255), 2);
+                    std::string triggerText = "Gate Pixels: " + std::to_string(rFrame.triggerDiag.value("nonZeroCount", 0)) +
+                                              " / " + std::to_string(rFrame.triggerDiag.value("minBallPixels", 0));
+                    cv::putText(annLeft, triggerText, cv::Point(roi.x, roi.y - 10),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 165, 255), 1);
+                }
+            }
             
             // Draw candidates
-            for (const auto& cand : rFrame.leftVisionDiag.candidates) {
-                if (cand.accepted) {
-                    cv::rectangle(annLeft, cand.boundingBox, cv::Scalar(0, 255, 0), 2);
-                    cv::line(annLeft, cv::Point2d(cand.centroid.x - 5, cand.centroid.y), cv::Point2d(cand.centroid.x + 5, cand.centroid.y), cv::Scalar(0, 255, 0), 2);
-                    cv::line(annLeft, cv::Point2d(cand.centroid.x, cand.centroid.y - 5), cv::Point2d(cand.centroid.x, cand.centroid.y + 5), cv::Scalar(0, 255, 0), 2);
-                    
-                    std::string lbl = "Ball (A:" + std::to_string((int)cand.area) + ", C:" + std::to_string(cand.circularity).substr(0, 4) + ")";
-                    cv::putText(annLeft, lbl, cv::Point(cand.boundingBox.x, cand.boundingBox.y - 5),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
+            if (rFrame.leftVisionDiag.contains("candidates")) {
+                for (const auto& candJ : rFrame.leftVisionDiag["candidates"]) {
+                    bool accepted = candJ.value("accepted", false);
+                    auto bbJ = candJ["boundingBox"];
+                    auto cenJ = candJ["centroid"];
+                    if (bbJ.is_array() && bbJ.size() == 4 && cenJ.is_array() && cenJ.size() == 2) {
+                        cv::Rect bb(bbJ[0], bbJ[1], bbJ[2], bbJ[3]);
+                        cv::Point2d cen(cenJ[0], cenJ[1]);
+                        
+                        if (accepted) {
+                            cv::rectangle(annLeft, bb, cv::Scalar(0, 255, 0), 2);
+                            cv::line(annLeft, cv::Point2d(cen.x - 5, cen.y), cv::Point2d(cen.x + 5, cen.y), cv::Scalar(0, 255, 0), 2);
+                            cv::line(annLeft, cv::Point2d(cen.x, cen.y - 5), cv::Point2d(cen.x, cen.y + 5), cv::Scalar(0, 255, 0), 2);
+                            
+                            std::string lbl = "Ball (A:" + std::to_string((int)candJ.value("area", 0.0)) + ")";
+                            cv::putText(annLeft, lbl, cv::Point(bb.x, bb.y - 5),
+                                        cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
 
-                    // Draw markers inside candidate
-                    for (const auto& mPos : cand.markers) {
-                        cv::circle(annLeft, mPos, 2, cv::Scalar(255, 0, 0), -1); // blue marker dot
+                            // Draw markers
+                            if (candJ.contains("markers")) {
+                                for (const auto& mJ : candJ["markers"]) {
+                                    if (mJ.is_array() && mJ.size() == 2) {
+                                        cv::circle(annLeft, cv::Point2d(mJ[0], mJ[1]), 2, cv::Scalar(255, 0, 0), -1);
+                                    }
+                                }
+                            }
+                        } else {
+                            cv::rectangle(annLeft, bb, cv::Scalar(0, 0, 255), 1);
+                            std::string lbl = "Noise: " + candJ.value("reason", "");
+                            cv::putText(annLeft, lbl, cv::Point(bb.x, bb.y - 5),
+                                        cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 255), 1);
+                        }
                     }
-                } else {
-                    cv::rectangle(annLeft, cand.boundingBox, cv::Scalar(0, 0, 255), 1);
-                    std::string lbl = "Noise: " + cand.reason;
-                    cv::putText(annLeft, lbl, cv::Point(cand.boundingBox.x, cand.boundingBox.y - 5),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 255), 1);
                 }
             }
 
@@ -161,25 +235,39 @@ void FlightRecorder::saveSession(
             cv::cvtColor(rFrame.rightFrame, annRight, cv::COLOR_GRAY2BGR);
             
             // Draw candidates
-            for (const auto& cand : rFrame.rightVisionDiag.candidates) {
-                if (cand.accepted) {
-                    cv::rectangle(annRight, cand.boundingBox, cv::Scalar(0, 255, 0), 2);
-                    cv::line(annRight, cv::Point2d(cand.centroid.x - 5, cand.centroid.y), cv::Point2d(cand.centroid.x + 5, cand.centroid.y), cv::Scalar(0, 255, 0), 2);
-                    cv::line(annRight, cv::Point2d(cand.centroid.x, cand.centroid.y - 5), cv::Point2d(cand.centroid.x, cand.centroid.y + 5), cv::Scalar(0, 255, 0), 2);
-                    
-                    std::string lbl = "Ball (A:" + std::to_string((int)cand.area) + ", C:" + std::to_string(cand.circularity).substr(0, 4) + ")";
-                    cv::putText(annRight, lbl, cv::Point(cand.boundingBox.x, cand.boundingBox.y - 5),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
+            if (rFrame.rightVisionDiag.contains("candidates")) {
+                for (const auto& candJ : rFrame.rightVisionDiag["candidates"]) {
+                    bool accepted = candJ.value("accepted", false);
+                    auto bbJ = candJ["boundingBox"];
+                    auto cenJ = candJ["centroid"];
+                    if (bbJ.is_array() && bbJ.size() == 4 && cenJ.is_array() && cenJ.size() == 2) {
+                        cv::Rect bb(bbJ[0], bbJ[1], bbJ[2], bbJ[3]);
+                        cv::Point2d cen(cenJ[0], cenJ[1]);
+                        
+                        if (accepted) {
+                            cv::rectangle(annRight, bb, cv::Scalar(0, 255, 0), 2);
+                            cv::line(annRight, cv::Point2d(cen.x - 5, cen.y), cv::Point2d(cen.x + 5, cen.y), cv::Scalar(0, 255, 0), 2);
+                            cv::line(annRight, cv::Point2d(cen.x, cen.y - 5), cv::Point2d(cen.x, cen.y + 5), cv::Scalar(0, 255, 0), 2);
+                            
+                            std::string lbl = "Ball (A:" + std::to_string((int)candJ.value("area", 0.0)) + ")";
+                            cv::putText(annRight, lbl, cv::Point(bb.x, bb.y - 5),
+                                        cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
 
-                    // Draw markers inside candidate
-                    for (const auto& mPos : cand.markers) {
-                        cv::circle(annRight, mPos, 2, cv::Scalar(255, 0, 0), -1); // blue marker dot
+                            // Draw markers
+                            if (candJ.contains("markers")) {
+                                for (const auto& mJ : candJ["markers"]) {
+                                    if (mJ.is_array() && mJ.size() == 2) {
+                                        cv::circle(annRight, cv::Point2d(mJ[0], mJ[1]), 2, cv::Scalar(255, 0, 0), -1);
+                                    }
+                                }
+                            }
+                        } else {
+                            cv::rectangle(annRight, bb, cv::Scalar(0, 0, 255), 1);
+                            std::string lbl = "Noise: " + candJ.value("reason", "");
+                            cv::putText(annRight, lbl, cv::Point(bb.x, bb.y - 5),
+                                        cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 255), 1);
+                        }
                     }
-                } else {
-                    cv::rectangle(annRight, cand.boundingBox, cv::Scalar(0, 0, 255), 1);
-                    std::string lbl = "Noise: " + cand.reason;
-                    cv::putText(annRight, lbl, cv::Point(cand.boundingBox.x, cand.boundingBox.y - 5),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 255), 1);
                 }
             }
 
@@ -195,43 +283,12 @@ void FlightRecorder::saveSession(
             cv::imwrite((annPath / ("right_" + filename)).string(), annRight);
         }
 
-        // Construct JSON frame representation
         nlohmann::json jFrame;
         jFrame["index"] = i;
         jFrame["timestamp"] = rFrame.timestamp;
-        
-        jFrame["trigger"] = {
-            {"nonZeroCount", rFrame.triggerDiag.nonZeroCount},
-            {"minBallPixels", rFrame.triggerDiag.minBallPixels},
-            {"pixelDiffThreshold", rFrame.triggerDiag.pixelDiffThreshold},
-            {"triggered", rFrame.triggerDiag.triggered},
-            {"gateROI", {rFrame.triggerDiag.gateROI.x, rFrame.triggerDiag.gateROI.y, rFrame.triggerDiag.gateROI.width, rFrame.triggerDiag.gateROI.height}}
-        };
-
-        auto serializeCandidates = [](const VisionDiagnostics& vd) {
-            nlohmann::json cands = nlohmann::json::array();
-            for (const auto& cand : vd.candidates) {
-                nlohmann::json jCand;
-                jCand["centroid"] = {cand.centroid.x, cand.centroid.y};
-                jCand["boundingBox"] = {cand.boundingBox.x, cand.boundingBox.y, cand.boundingBox.width, cand.boundingBox.height};
-                jCand["area"] = cand.area;
-                jCand["circularity"] = cand.circularity;
-                jCand["isOverlapping"] = cand.isOverlapping;
-                jCand["accepted"] = cand.accepted;
-                jCand["reason"] = cand.reason;
-                
-                nlohmann::json jMarkers = nlohmann::json::array();
-                for (const auto& m : cand.markers) {
-                    jMarkers.push_back({m.x, m.y});
-                }
-                jCand["markers"] = jMarkers;
-                cands.push_back(jCand);
-            }
-            return cands;
-        };
-
-        jFrame["leftVision"] = serializeCandidates(rFrame.leftVisionDiag);
-        jFrame["rightVision"] = serializeCandidates(rFrame.rightVisionDiag);
+        jFrame["trigger"] = rFrame.triggerDiag;
+        jFrame["leftVision"] = rFrame.leftVisionDiag;
+        jFrame["rightVision"] = rFrame.rightVisionDiag;
 
         nlohmann::json j3DBalls = nlohmann::json::array();
         for (const auto& ball3D : rFrame.triangulatedBalls) {
@@ -255,16 +312,14 @@ void FlightRecorder::saveSession(
 
     jMeta["frames"] = jFrames;
 
-    // Write metadata to file
     std::ofstream out((replayPath / "metadata.json").string());
     if (out.is_open()) {
         out << jMeta.dump(4);
         out.close();
-        spdlog::info("[FlightRecorder] Saved session directory: {}", replayPath.string());
+        spdlog::info("[FlightRecorder] Saved session directory asynchronously: {}", replayPath.string());
     } else {
         spdlog::error("[FlightRecorder] Failed to write metadata.json to {}", replayPath.string());
     }
 
-    // Enforce 10 replays limit
     enforceLimit();
 }

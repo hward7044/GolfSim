@@ -63,9 +63,18 @@ private:
 
     // Track state across incoming frames
     std::vector<Ball3D> trajectoryBuffer;
-    std::vector<RecordedFrame> recordedFrames;
+    std::vector<RecordedFrame> recordedFramesPool;
+    size_t         recordedFrameCount = 0;
     int            emptyFrameCount = 0;
     bool           inShot = false;
+
+    template<typename T>
+    nlohmann::json getTelemetry(const T& obj) {
+        if constexpr (requires { obj.getLatestDiagnostics(); }) {
+            return obj.getLatestDiagnostics();
+        }
+        return nlohmann::json::object();
+    }
 
     // Helper to log solved shot data to build/shot_history.json
     void saveToShotHistory(const LaunchData<Degrees, MilesPerHour>& data) {
@@ -103,7 +112,14 @@ public:
         vision(std::move(v)),
         spatial(std::move(s)),
         kinematics(std::move(k)),
-        network(std::move(n)) {}
+        network(std::move(n)) {
+        // Pre-allocate 40 recorded frames for zero-allocation copying in the hot path
+        recordedFramesPool.resize(40);
+        for (auto& rf : recordedFramesPool) {
+            rf.leftFrame = cv::Mat(800, 1280, CV_8UC1);
+            rf.rightFrame = cv::Mat(800, 1280, CV_8UC1);
+        }
+    }
 
     void processNextFrame(const FrameSet& set) {
         cv::Mat leftFrame = set.getFrame(CameraRole::STEREO_LEFT);
@@ -113,27 +129,27 @@ public:
             return;
         }
 
-        TriggerDiagnostics trigDiag;
-        bool triggeredNow = false;
+        nlohmann::json trigDiag;
 
         // 1. If not currently in a shot, monitor the optical gate for trigger event
         if (!inShot) {
-            if (trigger.checkOpticalGate(leftFrame, &trigDiag)) {
+            if (trigger.checkOpticalGate(leftFrame)) {
                 inShot = true;
                 trajectoryBuffer.clear();
-                recordedFrames.clear();
+                recordedFrameCount = 0;
                 emptyFrameCount = 0;
-                triggeredNow = true;
+                trigDiag = getTelemetry(trigger);
                 spdlog::info("[SessionStateMachine] Optical gate triggered! Starting shot capture...");
             }
         }
 
         // 2. If swing is triggered, detect and triangulate coordinates
         if (inShot) {
-            VisionDiagnostics leftVisionDiag;
-            VisionDiagnostics rightVisionDiag;
-            auto leftBalls = vision.detectBalls(leftFrame, &leftVisionDiag);
-            auto rightBalls = vision.detectBalls(rightFrame, &rightVisionDiag);
+            auto leftBalls = vision.detectBalls(leftFrame);
+            nlohmann::json leftVisionDiag = getTelemetry(vision);
+
+            auto rightBalls = vision.detectBalls(rightFrame);
+            nlohmann::json rightVisionDiag = getTelemetry(vision);
 
             std::vector<Ball3D> triangulated;
             if (!leftBalls.empty() || !rightBalls.empty()) {
@@ -149,16 +165,18 @@ public:
                 emptyFrameCount++;
             }
 
-            // Buffer the recorded frame (clone frames to avoid sharing references/buffers)
-            RecordedFrame rf;
-            rf.timestamp = set.timestamp;
-            rf.leftFrame = leftFrame.clone();
-            rf.rightFrame = rightFrame.clone();
-            rf.triggerDiag = trigDiag; // contains valid trigger info if triggered on this frame, otherwise default
-            rf.leftVisionDiag = leftVisionDiag;
-            rf.rightVisionDiag = rightVisionDiag;
-            rf.triangulatedBalls = triangulated;
-            recordedFrames.push_back(rf);
+            // Buffer the recorded frame (zero allocations memcpy)
+            if (recordedFrameCount < recordedFramesPool.size()) {
+                auto& rf = recordedFramesPool[recordedFrameCount];
+                rf.timestamp = set.timestamp;
+                leftFrame.copyTo(rf.leftFrame);
+                rightFrame.copyTo(rf.rightFrame);
+                rf.triggerDiag = trigDiag;
+                rf.leftVisionDiag = leftVisionDiag;
+                rf.rightVisionDiag = rightVisionDiag;
+                rf.triangulatedBalls = triangulated;
+                recordedFrameCount++;
+            }
 
             // 3. Option C Completion Check:
             //    - emptyFrameCount >= 15 (ball has left the frame) OR
@@ -182,8 +200,9 @@ public:
                     // Save shot parameters to file
                     saveToShotHistory(launchData);
 
-                    // Save raw and annotated data to FlightRecorder
-                    recorder.saveSession(recordedFrames, launchData);
+                    // Save raw and annotated data to FlightRecorder asynchronously
+                    std::vector<RecordedFrame> activeFrames(recordedFramesPool.begin(), recordedFramesPool.begin() + recordedFrameCount);
+                    recorder.saveSession(activeFrames, launchData);
                 } else {
                     spdlog::warn("[SessionStateMachine] Trajectory buffer has insufficient points ({}) to solve. Shot discarded.", 
                                  trajectoryBuffer.size());
@@ -192,7 +211,7 @@ public:
                 // Reset state parameters
                 inShot = false;
                 trajectoryBuffer.clear();
-                recordedFrames.clear();
+                recordedFrameCount = 0;
                 emptyFrameCount = 0;
                 trigger.reset();
             }

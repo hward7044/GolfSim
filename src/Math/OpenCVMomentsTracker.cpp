@@ -1,4 +1,5 @@
 #include "Math/OpenCVMomentsTracker.hpp"
+#include <opencv2/imgproc.hpp>
 #include <cmath>
 
 OpenCVMomentsTracker::OpenCVMomentsTracker(int ballThresh, int markerThresh, double minBAr, double maxBAr, double minBCirc)
@@ -6,7 +7,9 @@ OpenCVMomentsTracker::OpenCVMomentsTracker(int ballThresh, int markerThresh, dou
       markerThreshold_(markerThresh),
       minBallArea_(minBAr),
       maxBallArea_(maxBAr),
-      minBallCircularity_(minBCirc) {}
+      minBallCircularity_(minBCirc) {
+    latestDiag = {{"candidates", nlohmann::json::array()}};
+}
 
 // Helper to extract markers within a specific ball region
 std::vector<MarkerObservation> OpenCVMomentsTracker::extractMarkersInROI(
@@ -55,9 +58,12 @@ std::vector<MarkerObservation> OpenCVMomentsTracker::extractMarkersInROI(
     return markers;
 }
 
-std::vector<BallObservation> OpenCVMomentsTracker::detectBalls(const cv::Mat& frame, VisionDiagnostics* diag) {
+std::vector<BallObservation> OpenCVMomentsTracker::detectBalls(const cv::Mat& frame) {
     std::vector<BallObservation> ballObservations;
+    nlohmann::json candidates = nlohmann::json::array();
+
     if (frame.empty()) {
+        latestDiag = {{"candidates", candidates}};
         return ballObservations;
     }
 
@@ -83,17 +89,16 @@ std::vector<BallObservation> OpenCVMomentsTracker::detectBalls(const cv::Mat& fr
         cv::Point2d centroid(boundRect.x + boundRect.width / 2.0, boundRect.y + boundRect.height / 2.0);
 
         if (area < minBallArea_ || area > maxBallArea_) {
-            if (diag) {
-                VisionDiagnostics::Candidate cand;
-                cand.centroid = centroid;
-                cand.boundingBox = boundRect;
-                cand.area = area;
-                cand.circularity = 0.0;
-                cand.isOverlapping = false;
-                cand.accepted = false;
-                cand.reason = area < minBallArea_ ? "Area too small" : "Area too large";
-                diag->candidates.push_back(cand);
-            }
+            nlohmann::json cand;
+            cand["centroid"] = {centroid.x, centroid.y};
+            cand["boundingBox"] = {boundRect.x, boundRect.y, boundRect.width, boundRect.height};
+            cand["area"] = area;
+            cand["circularity"] = 0.0;
+            cand["isOverlapping"] = false;
+            cand["accepted"] = false;
+            cand["reason"] = area < minBallArea_ ? "Area too small" : "Area too large";
+            cand["markers"] = nlohmann::json::array();
+            candidates.push_back(cand);
             continue;
         }
 
@@ -124,17 +129,16 @@ std::vector<BallObservation> OpenCVMomentsTracker::detectBalls(const cv::Mat& fr
             cv::HoughCircles(localRegionBlurred_, circles, cv::HOUGH_GRADIENT, 1.0, 15.0, 50.0, 35.0, 12, 55);
 
             if (circles.empty()) {
-                if (diag) {
-                    VisionDiagnostics::Candidate cand;
-                    cand.centroid = centroid;
-                    cand.boundingBox = boundRect;
-                    cand.area = area;
-                    cand.circularity = circularity;
-                    cand.isOverlapping = true;
-                    cand.accepted = false;
-                    cand.reason = "Overlapping contour: no Hough circles found";
-                    diag->candidates.push_back(cand);
-                }
+                nlohmann::json cand;
+                cand["centroid"] = {centroid.x, centroid.y};
+                cand["boundingBox"] = {boundRect.x, boundRect.y, boundRect.width, boundRect.height};
+                cand["area"] = area;
+                cand["circularity"] = circularity;
+                cand["isOverlapping"] = true;
+                cand["accepted"] = false;
+                cand["reason"] = "Overlapping contour: no Hough circles found";
+                cand["markers"] = nlohmann::json::array();
+                candidates.push_back(cand);
             } else {
                 for (const auto& c : circles) {
                     cv::Point2d globalCentroid(searchRect.x + c[0], searchRect.y + c[1]);
@@ -153,20 +157,21 @@ std::vector<BallObservation> OpenCVMomentsTracker::detectBalls(const cv::Mat& fr
                     obs.markers = extractMarkersInROI(gray_, obs.boundingBox, markerThreshold_);
                     ballObservations.push_back(obs);
 
-                    if (diag) {
-                        VisionDiagnostics::Candidate cand;
-                        cand.centroid = globalCentroid;
-                        cand.boundingBox = clippedRoi;
-                        cand.area = area;
-                        cand.circularity = circularity;
-                        cand.isOverlapping = true;
-                        cand.accepted = true;
-                        cand.reason = "Accepted (Hough Circle)";
-                        for (const auto& m : obs.markers) {
-                            cand.markers.push_back(m.position);
-                        }
-                        diag->candidates.push_back(cand);
+                    nlohmann::json cand;
+                    cand["centroid"] = {globalCentroid.x, globalCentroid.y};
+                    cand["boundingBox"] = {clippedRoi.x, clippedRoi.y, clippedRoi.width, clippedRoi.height};
+                    cand["area"] = area;
+                    cand["circularity"] = circularity;
+                    cand["isOverlapping"] = true;
+                    cand["accepted"] = true;
+                    cand["reason"] = "Accepted (Hough Circle)";
+                    
+                    nlohmann::json jMarkers = nlohmann::json::array();
+                    for (const auto& m : obs.markers) {
+                        jMarkers.push_back({m.position.x, m.position.y});
                     }
+                    cand["markers"] = jMarkers;
+                    candidates.push_back(cand);
                 }
             }
         } else {
@@ -183,35 +188,36 @@ std::vector<BallObservation> OpenCVMomentsTracker::detectBalls(const cv::Mat& fr
                 obs.markers = extractMarkersInROI(gray_, boundRect, markerThreshold_);
                 ballObservations.push_back(obs);
 
-                if (diag) {
-                    VisionDiagnostics::Candidate cand;
-                    cand.centroid = momentsCentroid;
-                    cand.boundingBox = boundRect;
-                    cand.area = area;
-                    cand.circularity = circularity;
-                    cand.isOverlapping = false;
-                    cand.accepted = true;
-                    cand.reason = "Accepted (Moments)";
-                    for (const auto& m : obs.markers) {
-                        cand.markers.push_back(m.position);
-                    }
-                    diag->candidates.push_back(cand);
+                nlohmann::json cand;
+                cand["centroid"] = {momentsCentroid.x, momentsCentroid.y};
+                cand["boundingBox"] = {boundRect.x, boundRect.y, boundRect.width, boundRect.height};
+                cand["area"] = area;
+                cand["circularity"] = circularity;
+                cand["isOverlapping"] = false;
+                cand["accepted"] = true;
+                cand["reason"] = "Accepted (Moments)";
+                
+                nlohmann::json jMarkers = nlohmann::json::array();
+                for (const auto& m : obs.markers) {
+                    jMarkers.push_back({m.position.x, m.position.y});
                 }
+                cand["markers"] = jMarkers;
+                candidates.push_back(cand);
             } else {
-                if (diag) {
-                    VisionDiagnostics::Candidate cand;
-                    cand.centroid = centroid;
-                    cand.boundingBox = boundRect;
-                    cand.area = area;
-                    cand.circularity = circularity;
-                    cand.isOverlapping = false;
-                    cand.accepted = false;
-                    cand.reason = "Moments calculation failed (m00 == 0)";
-                    diag->candidates.push_back(cand);
-                }
+                nlohmann::json cand;
+                cand["centroid"] = {centroid.x, centroid.y};
+                cand["boundingBox"] = {boundRect.x, boundRect.y, boundRect.width, boundRect.height};
+                cand["area"] = area;
+                cand["circularity"] = circularity;
+                cand["isOverlapping"] = false;
+                cand["accepted"] = false;
+                cand["reason"] = "Moments calculation failed (m00 == 0)";
+                cand["markers"] = nlohmann::json::array();
+                candidates.push_back(cand);
             }
         }
     }
 
+    latestDiag = {{"candidates", candidates}};
     return ballObservations;
 }

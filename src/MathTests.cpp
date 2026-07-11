@@ -50,14 +50,16 @@ void testOpticalGateTrigger() {
     // Frame 3: Draw a bright square inside the ROI (representing a ball)
     cv::Mat frame3 = cv::Mat::zeros(100, 100, CV_8UC1);
     cv::rectangle(frame3, cv::Rect(20, 20, 20, 20), cv::Scalar(255), -1); // 400 white pixels
-    TriggerDiagnostics diag;
-    bool trig3 = trigger.checkOpticalGate(frame3, &diag);
+    bool trig3 = trigger.checkOpticalGate(frame3);
     assert(trig3); // Should trigger (400 > 100 min pixels)
-    assert(diag.triggered == trig3);
-    assert(diag.nonZeroCount > 0);
-    assert(diag.minBallPixels == 100);
-    assert(diag.pixelDiffThreshold == 15);
-    assert(diag.gateROI.width == 50);
+
+    // Check diagnostics
+    nlohmann::json diag = trigger.getLatestDiagnostics();
+    assert(diag["triggered"] == trig3);
+    assert(diag["nonZeroCount"].get<int>() > 0);
+    assert(diag["minBallPixels"] == 100);
+    assert(diag["pixelDiffThreshold"] == 15);
+    assert(diag["gateROI"][2] == 50); // width
 
     spdlog::info("[TEST] OpticalGateTrigger verification passed.");
 }
@@ -74,8 +76,7 @@ void testOpenCVMomentsTracker() {
     // Draw a small noise spot that will be rejected due to area < 50
     cv::circle(frame, cv::Point(20, 20), 1, cv::Scalar(100), -1);
 
-    VisionDiagnostics vdiag;
-    auto balls = tracker.detectBalls(frame, &vdiag);
+    auto balls = tracker.detectBalls(frame);
     assert(balls.size() == 1);
     assert(std::abs(balls[0].centroid.x - 200) < 1.0);
     assert(std::abs(balls[0].centroid.y - 200) < 1.0);
@@ -84,18 +85,22 @@ void testOpenCVMomentsTracker() {
     assert(std::abs(balls[0].markers[0].position.y - 195) < 1.0);
 
     // Verify diagnostics
-    assert(vdiag.candidates.size() >= 2);
+    nlohmann::json vdiag = tracker.getLatestDiagnostics();
+    assert(vdiag["candidates"].size() >= 2);
     bool foundBall = false;
     bool foundNoise = false;
-    for (const auto& cand : vdiag.candidates) {
-        if (cand.accepted) {
-            assert(std::abs(cand.centroid.x - 200) < 1.0);
-            assert(cand.reason == "Accepted (Moments)");
-            assert(cand.markers.size() == 1);
-            assert(std::abs(cand.markers[0].x - 205) < 1.0);
+    for (const auto& cand : vdiag["candidates"]) {
+        bool accepted = cand.value("accepted", false);
+        std::string reason = cand.value("reason", "");
+        if (accepted) {
+            auto cen = cand["centroid"];
+            assert(std::abs(cen[0].get<double>() - 200) < 1.0);
+            assert(reason == "Accepted (Moments)");
+            assert(cand["markers"].size() == 1);
+            assert(std::abs(cand["markers"][0][0].get<double>() - 205) < 1.0);
             foundBall = true;
         } else {
-            assert(cand.reason == "Area too small");
+            assert(reason == "Area too small");
             foundNoise = true;
         }
     }
@@ -257,23 +262,30 @@ void testFlightRecorder() {
         f.timestamp = i * 1000;
         f.leftFrame = cv::Mat::zeros(100, 100, CV_8UC1);
         f.rightFrame = cv::Mat::zeros(100, 100, CV_8UC1);
-        f.triggerDiag.nonZeroCount = 10;
-        f.triggerDiag.minBallPixels = 100;
-        f.triggerDiag.pixelDiffThreshold = 20;
-        f.triggerDiag.triggered = false;
-        f.triggerDiag.gateROI = cv::Rect(10, 10, 50, 50);
+        
+        f.triggerDiag = {
+            {"triggered", false},
+            {"nonZeroCount", 10},
+            {"minBallPixels", 100},
+            {"pixelDiffThreshold", 20},
+            {"gateROI", {10, 10, 50, 50}}
+        };
 
-        VisionDiagnostics::Candidate cand;
-        cand.centroid = cv::Point2d(50, 50);
-        cand.boundingBox = cv::Rect(40, 40, 20, 20);
-        cand.area = 400.0;
-        cand.circularity = 1.0;
-        cand.isOverlapping = false;
-        cand.accepted = true;
-        cand.reason = "Accepted (Moments)";
-        cand.markers.push_back(cv::Point2d(45, 45));
-        f.leftVisionDiag.candidates.push_back(cand);
-        f.rightVisionDiag.candidates.push_back(cand);
+        f.leftVisionDiag = {
+            {"candidates", {
+                {
+                    {"centroid", {50.0, 50.0}},
+                    {"boundingBox", {40, 40, 20, 20}},
+                    {"area", 400.0},
+                    {"circularity", 1.0},
+                    {"isOverlapping", false},
+                    {"accepted", true},
+                    {"reason", "Accepted (Moments)"},
+                    {"markers", {{45.0, 45.0}}}
+                }
+            }}
+        };
+        f.rightVisionDiag = f.leftVisionDiag;
 
         frames.push_back(f);
     }
@@ -291,6 +303,9 @@ void testFlightRecorder() {
         // sleep a tiny bit to ensure distinct ms timestamps
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
+
+    // Wait a little for async writes to finish
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
 
     // Check that we have exactly 10 directories in build/replays_test starting with shot_
     int count = 0;

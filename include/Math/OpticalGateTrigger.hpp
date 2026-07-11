@@ -1,8 +1,9 @@
 #pragma once
 #include "Math/ITriggerDetector.hpp"
-#include <opencv2/opencv.hpp>
+#include "Diagnostics/IDiagnosticProvider.hpp"
+#include <opencv2/core.hpp>
 
-class OpticalGateTrigger : public ITriggerDetector {
+class OpticalGateTrigger : public ITriggerDetector, public IDiagnosticProvider {
 private:
     cv::Rect gateROI;
     cv::Mat  backgroundRef; // Stored as CV_32FC1 for precise EMA updates
@@ -14,6 +15,7 @@ private:
     int      minBallPixels;
     int      pixelDiffThreshold;
     double   alpha;
+    nlohmann::json latestDiag;
 public:
     OpticalGateTrigger(
         cv::Rect roi = cv::Rect(400, 300, 200, 200), 
@@ -22,10 +24,10 @@ public:
         double alphaVal = 0.005
     );
 
-    bool checkOpticalGate(const cv::Mat& currentFrame) override {
-        return checkOpticalGate(currentFrame, nullptr);
-    }
-    bool checkOpticalGate(const cv::Mat& currentFrame, TriggerDiagnostics* diag) override;
+    bool checkOpticalGate(const cv::Mat& currentFrame) override;
     void reset() override;
-};
 
+    nlohmann::json getLatestDiagnostics() const override {
+        return latestDiag;
+    }
+};

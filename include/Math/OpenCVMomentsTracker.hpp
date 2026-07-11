@@ -1,7 +1,10 @@
 #pragma once
 #include "Math/IComputerVision.hpp"
+#include "Diagnostics/IDiagnosticProvider.hpp"
+#include <opencv2/core.hpp>
+#include <vector>
 
-class OpenCVMomentsTracker : public IComputerVision {
+class OpenCVMomentsTracker : public IComputerVision, public IDiagnosticProvider {
 private:
     int    ballThreshold_;
     int    markerThreshold_;
@@ -15,6 +18,8 @@ private:
     cv::Mat localRegion_;
     cv::Mat localRegionBlurred_;
     cv::Mat thresh_;
+    
+    nlohmann::json latestDiag;
 
     std::vector<MarkerObservation> extractMarkersInROI(
         const cv::Mat& gray, 
@@ -30,9 +35,9 @@ public:
         double minBCirc = 0.6
     );
 
-    std::vector<BallObservation> detectBalls(const cv::Mat& frame) override {
-        return detectBalls(frame, nullptr);
-    }
-    std::vector<BallObservation> detectBalls(const cv::Mat& frame, VisionDiagnostics* diag) override;
-};
+    std::vector<BallObservation> detectBalls(const cv::Mat& frame) override;
 
+    nlohmann::json getLatestDiagnostics() const override {
+        return latestDiag;
+    }
+};
