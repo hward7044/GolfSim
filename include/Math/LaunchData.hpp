@@ -1,5 +1,6 @@
 #pragma once
 #include <Eigen/Core>
+#include "Math/Units.hpp"
 
 // T.4 — express syntax tree / strong types
 // template<typename AngleUnit, typename SpeedUnit>
@@ -12,3 +13,4 @@ struct LaunchData {
     double     spinRPM;
     Eigen::Vector3d spinAxis;
 };
+

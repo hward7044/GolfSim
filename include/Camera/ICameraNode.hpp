@@ -9,4 +9,5 @@ public:
     /// @return true if frame was captured successfully.
     virtual bool captureFrame(cv::Mat& destination) = 0;
     virtual CameraRole getRole() = 0;
+    virtual void shutdown() {}
 };

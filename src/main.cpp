@@ -3,6 +3,9 @@
 #include <Eigen/Core>
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
+#include <thread>
+#include <chrono>
+#include <iomanip>
 
 #include "HAL/IUsbVideoDriver.hpp"
 #include "HAL/V4L2Driver.hpp"
@@ -32,6 +35,11 @@
 #include "Math/TcpJsonTransmitter.hpp"
 #include "Orchestration/SessionStateMachine.hpp"
 #include "Orchestration/ThreadManager.hpp"
+#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+
+const bool RUN_DEBUG_VIEWER = false;
+void runCameraDebugViewer();
 
 int main() {
     // Determine compiler-specific C++ standard version
@@ -69,6 +77,284 @@ int main() {
     std::cout << "OpenCV Matrix created successfully. Dimensions: " << image.rows << "x" << image.cols << std::endl;
 
     std::cout << "============================================" << std::endl;
+    
+    // Run C++ Math Verification Tests
+    void runMathTests();
+    runMathTests(); // Run verification tests on startup
+
     std::cout << "Verification completed successfully!" << std::endl;
+
+    if (RUN_DEBUG_VIEWER) {
+        runCameraDebugViewer();
+        return 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // Production Launch Monitor Pipeline
+    // -------------------------------------------------------------------------
+    std::cout << "\n============================================" << std::endl;
+    std::cout << "Starting Production Launch Monitor Pipeline" << std::endl;
+    std::cout << "============================================" << std::endl;
+
+    // Configure spdlog to write to both console and build/session.log
+    try {
+        auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+        auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>("build/session.log", true);
+        spdlog::set_default_logger(std::make_shared<spdlog::logger>("multi_sink", spdlog::sinks_init_list({console_sink, file_sink})));
+        spdlog::set_level(spdlog::level::info);
+        spdlog::flush_on(spdlog::level::info);
+    } catch (const spdlog::spdlog_ex& ex) {
+        std::cerr << "Log initialization failed: " << ex.what() << std::endl;
+    }
+
+    spdlog::info("[System] Initializing camera drivers...");
+    MediaFoundationDriver::logConnectedDevices();
+
+    // 2. Initialize the MediaFoundationDrivers
+    auto usbLeft = std::make_unique<MediaFoundationDriver>(0);
+    bool leftOk = usbLeft->initialize();
+    
+    auto usbRight = std::make_unique<MediaFoundationDriver>(1);
+    bool rightOk = usbRight->initialize();
+
+    if (!leftOk && !rightOk) {
+        spdlog::warn("[System] Failed to initialize camera hardware (expected in emulation/test environments). Clean exit.");
+        return 0;
+    }
+
+    auto cameraSystem = std::make_shared<HardwareSyncedCameraSystem>();
+    uint32_t width = 1280;
+    uint32_t height = 800;
+
+    if (leftOk) {
+        width = usbLeft->getFrameWidth();
+        height = usbLeft->getFrameHeight();
+        auto cameraNodeLeft = std::make_shared<OV9281CameraNode>(std::move(usbLeft), CameraRole::STEREO_LEFT);
+        cameraSystem->addCameraNode(cameraNodeLeft);
+        spdlog::info("[System] Successfully registered Left camera ({}x{})", width, height);
+    }
+
+    if (rightOk) {
+        width = usbRight->getFrameWidth();
+        height = usbRight->getFrameHeight();
+        auto cameraNodeRight = std::make_shared<OV9281CameraNode>(std::move(usbRight), CameraRole::STEREO_RIGHT);
+        cameraSystem->addCameraNode(cameraNodeRight);
+        spdlog::info("[System] Successfully registered Right camera ({}x{})", width, height);
+    }
+
+    // Queue buffer manager (capacity of 16 FrameSets)
+    auto buffer = std::make_shared<AtomicRingBuffer<FrameSet, 16>>();
+
+    // Pipeline components initialization:
+    // - Left camera optical gate trigger (Region of Interest, min Ball pixels, diff threshold, EMA alpha)
+    // - Image Moments tracker (Ball threshold, Marker threshold, min Area, max Area, min Circularity)
+    // - Stereo Triangulator (Uses default horizontal calibration)
+    // - Kinematics physics engine
+    // - Local network TCP transmitter (Target loopback, port 9002)
+    cv::Rect triggerRoi(100, 100, 400, 400);
+    auto trigger = OpticalGateTrigger(triggerRoi, 150, 25, 0.05);
+    auto vision = OpenCVMomentsTracker(80, 240, 80.0, 2500.0, 0.5);
+    auto spatial = StereoTriangulator();
+    auto kinematics = EigenBallisticsEngine();
+    auto network = TcpJsonTransmitter("127.0.0.1", 9002);
+
+    auto stateMachine = std::make_shared<ConcreteSSM>(
+        trigger,
+        vision,
+        spatial,
+        kinematics,
+        network
+    );
+
+    auto threadManager = std::make_shared<ThreadManager>(
+        cameraSystem,
+        buffer,
+        stateMachine
+    );
+
+    spdlog::info("[System] Starting background acquisition and tracking threads...");
+    threadManager->startProducerThread();
+    threadManager->startConsumerThread();
+
+    spdlog::info("[System] System is online and monitoring. Press Enter to shutdown.");
+    std::cin.get();
+
+    spdlog::info("[System] Shutting down threads...");
+    threadManager->stop();
+    spdlog::info("[System] Shutdown completed cleanly.");
     return 0;
+}
+
+// -------------------------------------------------------------------------
+// Live Camera Setup and Test Viewer (RUN_DEBUG_VIEWER = true)
+// -------------------------------------------------------------------------
+void runCameraDebugViewer() {
+    std::cout << "\n============================================" << std::endl;
+    std::cout << "Starting Live Camera Hookup and Test" << std::endl;
+    std::cout << "============================================" << std::endl;
+
+    // 1. Enumerate and log all connected video capture devices on the system
+    MediaFoundationDriver::logConnectedDevices();
+
+    // 2. Initialize the MediaFoundationDrivers
+    std::cout << "\nInitializing camera driver 0 (Left)..." << std::endl;
+    auto usbDriverLeft = std::make_unique<MediaFoundationDriver>(0);
+    bool leftOk = usbDriverLeft->initialize();
+    
+    std::cout << "Initializing camera driver 1 (Right)..." << std::endl;
+    auto usbDriverRight = std::make_unique<MediaFoundationDriver>(1);
+    bool rightOk = usbDriverRight->initialize();
+
+    if (!leftOk && !rightOk) {
+        std::cerr << "Failed to initialize either camera. Are they connected?" << std::endl;
+        return;
+    }
+
+    // 3 & 4. Create and Register the nodes with the camera system
+    HardwareSyncedCameraSystem cameraSystem;
+    uint32_t width = 1280;
+    uint32_t height = 800;
+
+    if (leftOk) {
+        width = usbDriverLeft->getFrameWidth();
+        height = usbDriverLeft->getFrameHeight();
+        auto cameraNodeLeft = std::make_shared<OV9281CameraNode>(std::move(usbDriverLeft), CameraRole::STEREO_LEFT);
+        cameraSystem.addCameraNode(cameraNodeLeft);
+        std::cout << "Successfully initialized Left camera! Resolution: " << width << "x" << height << std::endl;
+    } else {
+        std::cout << "Left camera was not detected/initialized." << std::endl;
+    }
+
+    if (rightOk) {
+        width = usbDriverRight->getFrameWidth();
+        height = usbDriverRight->getFrameHeight();
+        auto cameraNodeRight = std::make_shared<OV9281CameraNode>(std::move(usbDriverRight), CameraRole::STEREO_RIGHT);
+        cameraSystem.addCameraNode(cameraNodeRight);
+        std::cout << "Successfully initialized Right camera! Resolution: " << width << "x" << height << std::endl;
+    } else {
+        std::cout << "Right camera was not detected/initialized." << std::endl;
+    }
+
+    // 5. Pre-allocate the FrameSet buffer
+    FrameSet frameSet;
+    frameSet.preallocate(width, height);
+
+    enum ViewMode { VIEW_BOTH, VIEW_LEFT_ONLY, VIEW_RIGHT_ONLY };
+    int currentMode = VIEW_BOTH;
+
+    std::cout << "\nStarting live video display. Controls:" << std::endl;
+    std::cout << "  - Press TAB or 'v' inside the video window to cycle views (Both -> Left -> Right)" << std::endl;
+    std::cout << "  - Press ESC to quit" << std::endl;
+
+    std::string windowName = "Stereo Cameras Live Feed";
+    cv::namedWindow(windowName, cv::WINDOW_AUTOSIZE);
+
+    auto start_time = std::chrono::steady_clock::now();
+    uint32_t frame_count = 0;
+    double fps = 0.0;
+
+    while (true) {
+        if (!cameraSystem.captureSynchronizedFrames(frameSet)) {
+            std::cerr << "Failed to capture frames!" << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            continue;
+        }
+
+        frame_count++;
+
+        // Measure FPS
+        auto current_time = std::chrono::steady_clock::now();
+        std::chrono::duration<double> elapsed = current_time - start_time;
+        if (elapsed.count() >= 1.0) {
+            fps = frame_count / elapsed.count();
+            frame_count = 0;
+            start_time = current_time;
+        }
+
+        // Get the frames
+        cv::Mat leftFrame = frameSet.getFrame(CameraRole::STEREO_LEFT);
+        cv::Mat rightFrame = frameSet.getFrame(CameraRole::STEREO_RIGHT);
+
+        cv::Scalar meanLeft = leftFrame.empty() ? cv::Scalar(0) : cv::mean(leftFrame);
+        cv::Scalar meanRight = rightFrame.empty() ? cv::Scalar(0) : cv::mean(rightFrame);
+
+        // Print stats periodically to console
+        if (frame_count % 30 == 0) {
+            std::cout << "Frame Stats: L=" 
+                      << (leftFrame.empty() ? "N/A" : std::to_string(leftFrame.cols) + "x" + std::to_string(leftFrame.rows))
+                      << " (Avg=" << std::fixed << std::setprecision(1) << meanLeft[0] << ")"
+                      << " | R=" 
+                      << (rightFrame.empty() ? "N/A" : std::to_string(rightFrame.cols) + "x" + std::to_string(rightFrame.rows))
+                      << " (Avg=" << meanRight[0] << ")"
+                      << " | ViewMode=" << (currentMode == VIEW_BOTH ? "BOTH" : (currentMode == VIEW_LEFT_ONLY ? "LEFT" : "RIGHT"))
+                      << " | FPS=" << std::setprecision(2) << fps << "\r" << std::flush;
+        }
+
+        // Draw overlays
+        std::string fpsText = "FPS: " + std::to_string(fps).substr(0, 5);
+        cv::Mat displayLeft, displayRight;
+
+        if (!leftFrame.empty()) {
+            cv::cvtColor(leftFrame, displayLeft, cv::COLOR_GRAY2BGR);
+            std::string intTextL = "Intensity: " + std::to_string(meanLeft[0]).substr(0, 4);
+            cv::putText(displayLeft, "LEFT " + fpsText, cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
+            cv::putText(displayLeft, intTextL, cv::Point(20, 80), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
+        }
+
+        if (!rightFrame.empty()) {
+            cv::cvtColor(rightFrame, displayRight, cv::COLOR_GRAY2BGR);
+            std::string intTextR = "Intensity: " + std::to_string(meanRight[0]).substr(0, 4);
+            cv::putText(displayRight, "RIGHT " + fpsText, cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
+            cv::putText(displayRight, intTextR, cv::Point(20, 80), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
+        }
+
+        // Build composite image based on active view mode
+        cv::Mat frameToDraw;
+        if (currentMode == VIEW_BOTH) {
+            if (!displayLeft.empty() && !displayRight.empty()) {
+                cv::Mat resizedLeft, resizedRight;
+                cv::resize(displayLeft, resizedLeft, cv::Size(640, 400));
+                cv::resize(displayRight, resizedRight, cv::Size(640, 400));
+                cv::hconcat(resizedLeft, resizedRight, frameToDraw);
+            } else if (!displayLeft.empty()) {
+                frameToDraw = displayLeft;
+            } else if (!displayRight.empty()) {
+                frameToDraw = displayRight;
+            }
+        } else if (currentMode == VIEW_LEFT_ONLY) {
+            if (!displayLeft.empty()) {
+                frameToDraw = displayLeft;
+            } else {
+                frameToDraw = cv::Mat::zeros(400, 640, CV_8UC3);
+                cv::putText(frameToDraw, "LEFT CAMERA OFFLINE", cv::Point(120, 200), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
+            }
+        } else if (currentMode == VIEW_RIGHT_ONLY) {
+            if (!displayRight.empty()) {
+                frameToDraw = displayRight;
+            } else {
+                frameToDraw = cv::Mat::zeros(400, 640, CV_8UC3);
+                cv::putText(frameToDraw, "RIGHT CAMERA OFFLINE", cv::Point(120, 200), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
+            }
+        }
+
+        if (!frameToDraw.empty()) {
+            cv::imshow(windowName, frameToDraw);
+        }
+
+        // Break on ESC key, toggle views on TAB (9) or v/V (118/86)
+        int key = cv::waitKey(1);
+        if (key == 27) {
+            break;
+        } else if (key == 9 || key == 118 || key == 86) {
+            currentMode = (currentMode + 1) % 3;
+            std::cout << "\nSwitched View Mode to: " 
+                      << (currentMode == VIEW_BOTH ? "BOTH (50/50)" : (currentMode == VIEW_LEFT_ONLY ? "LEFT ONLY" : "RIGHT ONLY")) 
+                      << std::endl;
+        }
+    }
+
+    std::cout << "\nStopping acquisition..." << std::endl;
+    cv::destroyAllWindows();
+    cameraSystem.shutdown();
+    std::cout << "Shutdown completed cleanly." << std::endl;
 }

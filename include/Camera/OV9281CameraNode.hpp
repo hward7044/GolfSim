@@ -12,4 +12,5 @@ public:
     explicit OV9281CameraNode(std::unique_ptr<IUsbVideoDriver> driver, CameraRole role);
     bool captureFrame(cv::Mat& destination) override;
     CameraRole getRole() override;
+    void shutdown() override;
 };

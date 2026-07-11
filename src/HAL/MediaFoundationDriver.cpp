@@ -9,6 +9,8 @@
 #include <strmif.h>       // IAMCameraControl
 #include <vidcap.h>       // IKsTopologyInfo
 #include <ksmedia.h>      // KSNODETYPE_DEV_SPECIFIC
+#include <spdlog/spdlog.h>
+#include "HAL/OV9281Registers.hpp"
 
 // Link directives are handled in CMake, but these pragmas serve as documentation
 #pragma comment(lib, "mfplat.lib")
@@ -37,7 +39,8 @@ static constexpr DWORD ARDUCAM_XU_CONTROL_ID = 1;
 // Construction / Destruction
 // =============================================================================
 
-MediaFoundationDriver::MediaFoundationDriver() = default;
+MediaFoundationDriver::MediaFoundationDriver(uint32_t deviceIndex)
+    : deviceIndex_(deviceIndex) {}
 
 MediaFoundationDriver::~MediaFoundationDriver() {
     shutdown();
@@ -51,25 +54,24 @@ bool MediaFoundationDriver::initialize() {
     if (initialized_) return true;  // Idempotent
 
     if (!initializeMediaFoundation()) {
-        std::cerr << "[MediaFoundationDriver] Failed to initialize COM/MF" << std::endl;
+        spdlog::error("[MediaFoundationDriver] Failed to initialize COM/MF");
         shutdown();
         return false;
     }
     if (!enumerateAndOpenDevice()) {
-        std::cerr << "[MediaFoundationDriver] Target OV9281 camera not found/opened." << std::endl;
+        spdlog::error("[MediaFoundationDriver] Target OV9281 camera not found/opened.");
         shutdown();
         return false;
     }
     if (!configureSourceReader()) {
-        std::cerr << "[MediaFoundationDriver] Failed to configure source reader media types." << std::endl;
+        spdlog::error("[MediaFoundationDriver] Failed to configure source reader media types.");
         shutdown();
         return false;
     }
 
     // Attempt to locate and configure the USB Extension Unit for I2C writes
     if (!discoverExtensionUnit()) {
-        std::cerr << "[MediaFoundationDriver] Extension Unit discovery failed. "
-                     "Register writes will be unavailable." << std::endl;
+        spdlog::warn("[MediaFoundationDriver] Extension Unit discovery failed. Register writes will be unavailable.");
         // Non-fatal: camera can still grab frames
     } else {
         // Pre-build the KSP_NODE template so injectImmediateRegisterWrite()
@@ -82,6 +84,10 @@ bool MediaFoundationDriver::initialize() {
     }
 
     initialized_ = true;
+
+    // Apply trigger and exposure configurations (non-blocking, failures logged as warnings)
+    configureTriggerAndExposureSettings();
+
     return true;
 }
 
@@ -89,14 +95,15 @@ void MediaFoundationDriver::shutdown() {
     // Guard against double-shutdown (destructor + explicit call)
     initialized_ = false;
 
-    // Release in reverse order of acquisition
-    ksControl_.Reset();
-
-    sourceReader_.Reset();
+    // First shut down the media source to unblock any pending ReadSample() calls
     if (mediaSource_) {
         mediaSource_->Shutdown();
-        mediaSource_.Reset();
     }
+
+    // Release in reverse order of acquisition
+    ksControl_.Reset();
+    sourceReader_.Reset();
+    mediaSource_.Reset();
 
     // Only tear down subsystems we initialized
     if (mfInitializedByUs_) {
@@ -157,6 +164,7 @@ bool MediaFoundationDriver::enumerateAndOpenDevice() {
     if (FAILED(hr) || count == 0) return false;
 
     bool found = false;
+    uint32_t matchCount = 0;
     for (UINT32 i = 0; i < count; ++i) {
         if (!ppDevices[i]) continue;  // Defensive null check
 
@@ -183,28 +191,93 @@ bool MediaFoundationDriver::enumerateAndOpenDevice() {
         CoTaskMemFree(szFriendlyName);
         CoTaskMemFree(szLinks);
 
-        // Match by VID/PID in symbolic link, or by known camera name strings
+        bool isMatch = false;
         if (linkStr.find(TARGET_VID) != std::wstring::npos &&
             linkStr.find(TARGET_PID) != std::wstring::npos) {
-            // Best match: both VID and PID
-            hr = ppDevices[i]->ActivateObject(IID_PPV_ARGS(&mediaSource_));
-            if (SUCCEEDED(hr)) {
-                found = true;
+            isMatch = true;
+        } else if (nameStr.find(L"Arducam") != std::wstring::npos ||
+                   nameStr.find(L"OV9281")  != std::wstring::npos) {
+            isMatch = true;
+        }
+
+        if (isMatch) {
+            if (matchCount == deviceIndex_) {
+                hr = ppDevices[i]->ActivateObject(IID_PPV_ARGS(&mediaSource_));
+                if (SUCCEEDED(hr)) {
+                    found = true;
+                    std::string narrowName(nameStr.begin(), nameStr.end());
+                    spdlog::info("[MediaFoundationDriver] Successfully activated device at index {} (Name: {})",
+                                 deviceIndex_, narrowName);
+                }
             }
-        } else if (!found && (
-            nameStr.find(L"Arducam") != std::wstring::npos ||
-            nameStr.find(L"OV9281")  != std::wstring::npos)) {
-            // Fallback: match by friendly name
-            hr = ppDevices[i]->ActivateObject(IID_PPV_ARGS(&mediaSource_));
-            if (SUCCEEDED(hr)) {
-                found = true;
-            }
+            matchCount++;
         }
 
         ppDevices[i]->Release();
     }
     CoTaskMemFree(ppDevices);
     return found;
+}
+
+void MediaFoundationDriver::logConnectedDevices() {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    bool comInit = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+    bool comShouldUninit = (hr == S_OK || hr == S_FALSE);
+
+    hr = MFStartup(MF_VERSION);
+    bool mfInit = SUCCEEDED(hr);
+
+    if (mfInit) {
+        ComPtr<IMFAttributes> pAttributes;
+        hr = MFCreateAttributes(&pAttributes, 1);
+        if (SUCCEEDED(hr)) {
+            hr = pAttributes->SetGUID(
+                MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID
+            );
+            if (SUCCEEDED(hr)) {
+                UINT32 count = 0;
+                IMFActivate** ppDevices = nullptr;
+                hr = MFEnumDeviceSources(pAttributes.Get(), &ppDevices, &count);
+                if (SUCCEEDED(hr)) {
+                    spdlog::info("[MediaFoundationDriver] Enumerating connected video devices (Total: {}):", count);
+                    for (UINT32 i = 0; i < count; ++i) {
+                        if (!ppDevices[i]) continue;
+                        WCHAR* szFriendlyName = nullptr;
+                        UINT32 cchFriendlyName = 0;
+                        ppDevices[i]->GetAllocatedString(
+                            MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &szFriendlyName, &cchFriendlyName
+                        );
+
+                        WCHAR* szLinks = nullptr;
+                        UINT32 cchLinks = 0;
+                        ppDevices[i]->GetAllocatedString(
+                            MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, &szLinks, &cchLinks
+                        );
+
+                        std::wstring nameW(szFriendlyName ? szFriendlyName : L"");
+                        std::wstring linkW(szLinks ? szLinks : L"");
+
+                        std::string nameStr(nameW.begin(), nameW.end());
+                        std::string linkStr(linkW.begin(), linkW.end());
+
+                        spdlog::info("  Device [{}]:", i);
+                        spdlog::info("    Name: {}", nameStr);
+                        spdlog::info("    Link: {}", linkStr);
+
+                        CoTaskMemFree(szFriendlyName);
+                        CoTaskMemFree(szLinks);
+                        ppDevices[i]->Release();
+                    }
+                    CoTaskMemFree(ppDevices);
+                }
+            }
+        }
+        MFShutdown();
+    }
+    if (comInit && comShouldUninit) {
+        CoUninitialize();
+    }
 }
 
 // =============================================================================
@@ -523,11 +596,33 @@ void MediaFoundationDriver::injectImmediateRegisterWrite(uint16_t reg, uint8_t v
 
     if (FAILED(hr)) {
         // Only log on failure — success path is completely silent for speed
-        std::cerr << "[MediaFoundationDriver] KsProperty register write failed. "
-                  << "reg=0x" << std::hex << reg << " val=0x"
-                  << static_cast<unsigned>(value)
-                  << " HR=0x" << hr << std::dec << std::endl;
+        spdlog::error("[MediaFoundationDriver] KsProperty register write failed. reg=0x{:04X} val=0x{:02X} HR=0x{:08X}",
+                      reg, value, static_cast<unsigned long>(hr));
     }
+}
+
+void MediaFoundationDriver::configureTriggerAndExposureSettings() {
+    if (!ksControl_) {
+        spdlog::warn("[MediaFoundationDriver] Extension unit unavailable. Skipping startup register configuration.");
+        return;
+    }
+
+    spdlog::info("[MediaFoundationDriver] Configuring OV9281 registers for external trigger mode & 10ms exposure.");
+
+    // Setup external trigger mode:
+    // Typical OV9281 configuration: 
+    // - 0x3006: FSIN pin input enable (value 0x02)
+    // - 0x3812: Set external trigger mode (value 0x30)
+    injectImmediateRegisterWrite(0x3006, 0x02);
+    injectImmediateRegisterWrite(0x3812, 0x30);
+
+    // Set exposure to 10ms (approx 840 line periods at ~11.9us row time)
+    // 840 = 0x0348 -> EXPOSURE_HI (0x3500) = 0x00, EXPOSURE_MID (0x3501) = 0x03, EXPOSURE_LO (0x3502) = 0x48
+    injectImmediateRegisterWrite(OV9281Reg::EXPOSURE_HI, 0x00);
+    injectImmediateRegisterWrite(OV9281Reg::EXPOSURE_MID, 0x03);
+    injectImmediateRegisterWrite(OV9281Reg::EXPOSURE_LO, 0x48);
+
+    spdlog::info("[MediaFoundationDriver] Startup registers written successfully.");
 }
 
 #endif

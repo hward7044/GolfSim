@@ -19,3 +19,9 @@ void OV9281CameraNode::enableHardwareStrobeMode() {
         usbDriver->injectImmediateRegisterWrite(OV9281Reg::STREAM_ON, 0x01);
     }
 }
+
+void OV9281CameraNode::shutdown() {
+    if (usbDriver) {
+        usbDriver->shutdown();
+    }
+}
