@@ -1,5 +1,7 @@
 #include "Math/Units.hpp"
 #include "Math/OpticalGateTrigger.hpp"
+#include "Math/BallPresenceTrigger.hpp"
+#include "Math/StereoBallTrackerTrigger.hpp"
 #include "Math/OpenCVMomentsTracker.hpp"
 #include "Math/StereoTriangulator.hpp"
 #include "Math/EigenBallisticsEngine.hpp"
@@ -34,34 +36,52 @@ void testUnits() {
     spdlog::info("[TEST] Units verification passed.");
 }
 
-void testOpticalGateTrigger() {
-    cv::Rect roi(10, 10, 50, 50);
-    OpticalGateTrigger trigger(roi, 100, 15, 0.1);
+void testBallPresenceTrigger() {
+    cv::Rect teeRoi(10, 10, 80, 80);
+    BallPresenceTrigger trigger(teeRoi, 5, 50, 50, 1000, 0.5, 0.5);
 
-    // Frame 1: Blank frame (all black)
-    cv::Mat frame1 = cv::Mat::zeros(100, 100, CV_8UC1);
-    bool trig1 = trigger.checkOpticalGate(frame1);
-    assert(!trig1); // First frame should initialize background
+    // Frame with a stable circular ball (radius 15) inside tee ROI
+    cv::Mat ballFrame = cv::Mat::zeros(100, 100, CV_8UC1);
+    cv::circle(ballFrame, cv::Point(50, 50), 15, cv::Scalar(200), -1);
 
-    // Frame 2: Still blank
-    bool trig2 = trigger.checkOpticalGate(frame1);
-    assert(!trig2); // No difference
+    // Feed for 4 frames (under stability threshold 5)
+    for (int i = 0; i < 4; ++i) {
+        bool trig = trigger.checkOpticalGate(ballFrame);
+        assert(!trig);
+        nlohmann::json diag = trigger.getLatestDiagnostics();
+        assert(diag["state"] == "WAITING_FOR_BALL");
+        assert(diag["stabilityCounter"] == i + 1);
+    }
 
-    // Frame 3: Draw a bright square inside the ROI (representing a ball)
-    cv::Mat frame3 = cv::Mat::zeros(100, 100, CV_8UC1);
-    cv::rectangle(frame3, cv::Rect(20, 20, 20, 20), cv::Scalar(255), -1); // 400 white pixels
-    bool trig3 = trigger.checkOpticalGate(frame3);
-    assert(trig3); // Should trigger (400 > 100 min pixels)
+    // 5th frame reaches stability threshold -> BALL_LOCKED
+    bool trigLock = trigger.checkOpticalGate(ballFrame);
+    assert(!trigLock);
+    nlohmann::json diagLocked = trigger.getLatestDiagnostics();
+    assert(diagLocked["state"] == "BALL_LOCKED");
 
-    // Check diagnostics
-    nlohmann::json diag = trigger.getLatestDiagnostics();
-    assert(diag["triggered"] == trig3);
-    assert(diag["nonZeroCount"].get<int>() > 0);
-    assert(diag["minBallPixels"] == 100);
-    assert(diag["pixelDiffThreshold"] == 15);
-    assert(diag["gateROI"][2] == 50); // width
+    // Shadow Test: Dim the ball intensity by 30% (simulating hand/club shadow or IR fluctuation)
+    cv::Mat dimmedFrame = cv::Mat::zeros(100, 100, CV_8UC1);
+    cv::circle(dimmedFrame, cv::Point(50, 50), 15, cv::Scalar(140), -1);
+    bool trigShadow = trigger.checkOpticalGate(dimmedFrame);
+    assert(!trigShadow); // SHADOW IMMUNITY PASSED: Must NOT trigger false departure!
+    nlohmann::json diagShadow = trigger.getLatestDiagnostics();
+    assert(diagShadow["state"] == "BALL_LOCKED");
+    assert(diagShadow["matchScore"].get<float>() > 0.70f);
 
-    spdlog::info("[TEST] OpticalGateTrigger verification passed.");
+    // Departure Test: Feed black frame (ball physically departed from tee)
+    cv::Mat blankFrame = cv::Mat::zeros(100, 100, CV_8UC1);
+    bool trigDeparted = trigger.checkOpticalGate(blankFrame);
+    assert(trigDeparted); // Triggered! Ball pixel pattern vanished.
+    nlohmann::json diagDeparted = trigger.getLatestDiagnostics();
+    assert(diagDeparted["state"] == "BALL_DEPARTED");
+
+    // Test reset
+    trigger.reset();
+    nlohmann::json diagReset = trigger.getLatestDiagnostics();
+    assert(diagReset["state"] == "WAITING_FOR_BALL");
+    assert(diagReset["stabilityCounter"] == 0);
+
+    spdlog::info("[TEST] BallPresenceTrigger verification passed.");
 }
 
 void testOpenCVMomentsTracker() {
@@ -76,6 +96,9 @@ void testOpenCVMomentsTracker() {
     // Draw a small noise spot that will be rejected due to area < 50
     cv::circle(frame, cv::Point(20, 20), 1, cv::Scalar(100), -1);
 
+    // Draw a thin rectangle (area ~100) that has low circularity (< 0.5) to test circularity rejection
+    cv::rectangle(frame, cv::Rect(300, 50, 4, 25), cv::Scalar(100), -1);
+
     auto balls = tracker.detectBalls(frame);
     assert(balls.size() == 1);
     assert(std::abs(balls[0].centroid.x - 200) < 1.0);
@@ -86,9 +109,10 @@ void testOpenCVMomentsTracker() {
 
     // Verify diagnostics
     nlohmann::json vdiag = tracker.getLatestDiagnostics();
-    assert(vdiag["candidates"].size() >= 2);
+    assert(vdiag["candidates"].size() >= 3);
     bool foundBall = false;
-    bool foundNoise = false;
+    bool foundNoiseArea = false;
+    bool foundNoiseCirc = false;
     for (const auto& cand : vdiag["candidates"]) {
         bool accepted = cand.value("accepted", false);
         std::string reason = cand.value("reason", "");
@@ -99,13 +123,15 @@ void testOpenCVMomentsTracker() {
             assert(cand["markers"].size() == 1);
             assert(std::abs(cand["markers"][0][0].get<double>() - 205) < 1.0);
             foundBall = true;
-        } else {
-            assert(reason == "Area too small");
-            foundNoise = true;
+        } else if (reason == "Area too small") {
+            foundNoiseArea = true;
+        } else if (reason == "Circularity too low") {
+            foundNoiseCirc = true;
         }
     }
     assert(foundBall);
-    assert(foundNoise);
+    assert(foundNoiseArea);
+    assert(foundNoiseCirc);
 
     spdlog::info("[TEST] OpenCVMomentsTracker verification passed.");
 }
@@ -304,8 +330,8 @@ void testFlightRecorder() {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
-    // Wait a little for async writes to finish
-    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    // Wait for async worker thread to finish writing files
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
 
     // Check that we have exactly 10 directories in build/replays_test starting with shot_
     int count = 0;
@@ -325,13 +351,112 @@ void testFlightRecorder() {
     spdlog::info("[TEST] FlightRecorder verification passed.");
 }
 
+void testStereoBallTrackerTrigger() {
+    StereoCalibration calib;
+    calib.K_L = (cv::Mat_<double>(3, 3) << 1000.0, 0.0, 640.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 1.0);
+    calib.D_L = cv::Mat::zeros(1, 5, CV_64F);
+    calib.K_R = calib.K_L.clone();
+    calib.D_R = calib.D_L.clone();
+    calib.R = cv::Mat::eye(3, 3, CV_64F);
+    calib.T = (cv::Mat_<double>(3, 1) << -0.1, 0.0, 0.0); // 100mm baseline
+    calib.R_L = cv::Mat::eye(3, 3, CV_64F);
+    calib.R_R = cv::Mat::eye(3, 3, CV_64F);
+    calib.P_L = (cv::Mat_<double>(3, 4) << 1000.0, 0.0, 640.0, 0.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0);
+    calib.P_R = (cv::Mat_<double>(3, 4) << 1000.0, 0.0, 640.0, -100.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0);
+
+    // Instantiate tracker with wide search ROI and 2ft parameters
+    cv::Rect searchRoiL(400, 200, 480, 400);
+    cv::Rect searchRoiR(400, 200, 480, 400);
+    StereoBallTrackerTrigger trigger(calib, searchRoiL, searchRoiR, 25.0, 50.0, 0.60, 100, 3.0, 256, 4, 4.0, 0.04);
+
+    // Frame setup for ball at (0, 0, 0.6) m (2 ft distance)
+    // f = 1000, B = 0.1m => Disparity d = (f * B) / Z = 100 / 0.6 = 166.67 px
+    // Left center (640, 400), Right center (640 - 167 = 473, 400)
+    // Radius at 0.6m = 1000 * (0.021335 / 0.6) = 35.56 px -> radius = 35 px
+    cv::Mat frameL = cv::Mat::zeros(800, 1280, CV_8UC1);
+    cv::Mat frameR = cv::Mat::zeros(800, 1280, CV_8UC1);
+    cv::circle(frameL, cv::Point(640, 400), 35, cv::Scalar(200), -1);
+    cv::circle(frameR, cv::Point(473, 400), 35, cv::Scalar(200), -1);
+
+    // 1. Test SEARCHING -> ARMED Transition
+    bool trig1 = trigger.checkTrigger(frameL, frameR);
+    assert(!trig1);
+    assert(trigger.getState() == StereoTriggerState::ARMED);
+    auto pos3D = trigger.getLastKnown3DPosition();
+    assert(std::abs(pos3D.z() - 0.6) < 0.02);
+
+    // 2. Test SINGLE-CAMERA OCCLUSION IMMUNITY (hand behind ball)
+    cv::Mat occludedFrameL = frameL.clone();
+    cv::rectangle(occludedFrameL, cv::Rect(600, 350, 100, 100), cv::Scalar(180), -1);
+    cv::Mat blankFrameR = cv::Mat::zeros(800, 1280, CV_8UC1);
+
+    bool trigOcc = trigger.checkTrigger(occludedFrameL, blankFrameR);
+    assert(!trigOcc);
+    assert(trigger.getState() == StereoTriggerState::ARMED);
+
+    // 3. Test DUAL-CAMERA LOSS GRACE WINDOW
+    for (int i = 0; i < 3; ++i) {
+        bool trigGrace = trigger.checkTrigger(blankFrameR, blankFrameR);
+        assert(!trigGrace);
+        assert(trigger.getState() == StereoTriggerState::ARMED);
+    }
+    bool trigReset = trigger.checkTrigger(blankFrameR, blankFrameR);
+    assert(!trigReset);
+    assert(trigger.getState() == StereoTriggerState::SEARCHING);
+
+    // Re-lock ball to ARMED
+    trigger.checkTrigger(frameL, frameR);
+    assert(trigger.getState() == StereoTriggerState::ARMED);
+
+    // 4. Test VIBRATION / NUDGE REJECTION
+    // Displace ball slightly by 45 mm (beyond 40 mm threshold), but low speed (0.5 m/s)
+    // At Z=0.6m, 45mm horizontal displacement = ~75 px -> u_L = 640 + 75 = 715, u_R = 473 + 75 = 548
+    cv::Mat nudgeL = cv::Mat::zeros(800, 1280, CV_8UC1);
+    cv::Mat nudgeR = cv::Mat::zeros(800, 1280, CV_8UC1);
+    cv::circle(nudgeL, cv::Point(715, 400), 35, cv::Scalar(200), -1);
+    cv::circle(nudgeR, cv::Point(548, 400), 35, cv::Scalar(200), -1);
+
+    bool trigNudge = trigger.checkTrigger(nudgeL, nudgeR);
+    assert(!trigNudge);
+    assert(trigger.getState() == StereoTriggerState::CONFIRMING);
+
+    for (int i = 0; i < 3; ++i) {
+        bool trigConfirm = trigger.checkTrigger(nudgeL, nudgeR);
+        assert(!trigConfirm);
+    }
+    assert(trigger.getState() == StereoTriggerState::ARMED);
+
+    // 5. Test VALID HIGH-VELOCITY IMPACT TRIGGER
+    // Displace ball at launch speed 40 m/s (~90 mph)
+    cv::Mat launchL = cv::Mat::zeros(800, 1280, CV_8UC1);
+    cv::Mat launchR = cv::Mat::zeros(800, 1280, CV_8UC1);
+    cv::circle(launchL, cv::Point(800, 400), 35, cv::Scalar(200), -1);
+    cv::circle(launchR, cv::Point(633, 400), 35, cv::Scalar(200), -1);
+
+    bool trigImpact1 = trigger.checkTrigger(launchL, launchR);
+    assert(!trigImpact1);
+    assert(trigger.getState() == StereoTriggerState::CONFIRMING);
+
+    cv::Mat launchL2 = cv::Mat::zeros(800, 1280, CV_8UC1);
+    cv::Mat launchR2 = cv::Mat::zeros(800, 1280, CV_8UC1);
+    cv::circle(launchL2, cv::Point(900, 400), 35, cv::Scalar(200), -1);
+    cv::circle(launchR2, cv::Point(733, 400), 35, cv::Scalar(200), -1);
+
+    bool trigImpact2 = trigger.checkTrigger(launchL2, launchR2);
+    assert(trigImpact2);
+    assert(trigger.getState() == StereoTriggerState::CAPTURED);
+
+    spdlog::info("[TEST] StereoBallTrackerTrigger verification passed.");
+}
+
 void runMathTests() {
     spdlog::info("============================================");
     spdlog::info("Starting C++ Math Verification Tests...");
     spdlog::info("============================================");
 
     testUnits();
-    testOpticalGateTrigger();
+    testBallPresenceTrigger();
+    testStereoBallTrackerTrigger();
     testOpenCVMomentsTracker();
     testStereoTriangulatorAndRaySphere();
     testKinematicsEngine();

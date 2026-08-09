@@ -169,8 +169,33 @@ void FlightRecorder::processSaveTask(const SaveTask& task) {
         if (!rFrame.leftFrame.empty()) {
             cv::cvtColor(rFrame.leftFrame, annLeft, cv::COLOR_GRAY2BGR);
             
-            // Draw trigger box if data is valid
-            if (rFrame.triggerDiag.contains("gateROI")) {
+            // Draw trigger box (teeROI in orange, locked ball in cyan if available)
+            if (rFrame.triggerDiag.contains("teeROI")) {
+                auto roiJ = rFrame.triggerDiag["teeROI"];
+                if (roiJ.is_array() && roiJ.size() == 4) {
+                    cv::Rect roi(roiJ[0], roiJ[1], roiJ[2], roiJ[3]);
+                    cv::rectangle(annLeft, roi, cv::Scalar(0, 165, 255), 2); // Orange tee ROI
+                    
+                    std::string st = rFrame.triggerDiag.value("state", "TRIGGER");
+                    int count = rFrame.triggerDiag.value("stabilityCounter", 0);
+                    int maxCount = rFrame.triggerDiag.value("lockFrameCount", 30);
+                    float score = rFrame.triggerDiag.value("matchScore", 1.0f);
+                    
+                    char scoreBuf[32];
+                    snprintf(scoreBuf, sizeof(scoreBuf), " (Match: %.2f)", score);
+                    std::string triggerText = st + " (" + std::to_string(count) + "/" + std::to_string(maxCount) + ")" + scoreBuf;
+                    cv::putText(annLeft, triggerText, cv::Point(roi.x, roi.y - 10),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 165, 255), 1);
+                }
+
+                if (rFrame.triggerDiag.contains("lockedBallBox")) {
+                    auto lboxJ = rFrame.triggerDiag["lockedBallBox"];
+                    if (lboxJ.is_array() && lboxJ.size() == 4 && lboxJ[2].get<int>() > 0) {
+                        cv::Rect lbox(lboxJ[0], lboxJ[1], lboxJ[2], lboxJ[3]);
+                        cv::rectangle(annLeft, lbox, cv::Scalar(255, 255, 0), 2); // Cyan locked ball
+                    }
+                }
+            } else if (rFrame.triggerDiag.contains("gateROI")) {
                 auto roiJ = rFrame.triggerDiag["gateROI"];
                 if (roiJ.is_array() && roiJ.size() == 4) {
                     cv::Rect roi(roiJ[0], roiJ[1], roiJ[2], roiJ[3]);
@@ -184,6 +209,7 @@ void FlightRecorder::processSaveTask(const SaveTask& task) {
             
             // Draw candidates
             if (rFrame.leftVisionDiag.contains("candidates")) {
+                int noiseCountLeft = 0;
                 for (const auto& candJ : rFrame.leftVisionDiag["candidates"]) {
                     bool accepted = candJ.value("accepted", false);
                     auto bbJ = candJ["boundingBox"];
@@ -209,7 +235,8 @@ void FlightRecorder::processSaveTask(const SaveTask& task) {
                                     }
                                 }
                             }
-                        } else {
+                        } else if (noiseCountLeft < 15) {
+                            noiseCountLeft++;
                             cv::rectangle(annLeft, bb, cv::Scalar(0, 0, 255), 1);
                             std::string lbl = "Noise: " + candJ.value("reason", "");
                             cv::putText(annLeft, lbl, cv::Point(bb.x, bb.y - 5),
@@ -236,6 +263,7 @@ void FlightRecorder::processSaveTask(const SaveTask& task) {
             
             // Draw candidates
             if (rFrame.rightVisionDiag.contains("candidates")) {
+                int noiseCountRight = 0;
                 for (const auto& candJ : rFrame.rightVisionDiag["candidates"]) {
                     bool accepted = candJ.value("accepted", false);
                     auto bbJ = candJ["boundingBox"];
@@ -261,7 +289,8 @@ void FlightRecorder::processSaveTask(const SaveTask& task) {
                                     }
                                 }
                             }
-                        } else {
+                        } else if (noiseCountRight < 15) {
+                            noiseCountRight++;
                             cv::rectangle(annRight, bb, cv::Scalar(0, 0, 255), 1);
                             std::string lbl = "Noise: " + candJ.value("reason", "");
                             cv::putText(annRight, lbl, cv::Point(bb.x, bb.y - 5),

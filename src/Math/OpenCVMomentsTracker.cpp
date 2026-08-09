@@ -175,8 +175,21 @@ std::vector<BallObservation> OpenCVMomentsTracker::detectBalls(const cv::Mat& fr
                 }
             }
         } else {
-            // Process contour. Even if circularity is slightly below threshold, we still fallback to 
-            // moments centroid tracking instead of silently discarding it.
+            if (circularity < minBallCircularity_) {
+                nlohmann::json cand;
+                cand["centroid"] = {centroid.x, centroid.y};
+                cand["boundingBox"] = {boundRect.x, boundRect.y, boundRect.width, boundRect.height};
+                cand["area"] = area;
+                cand["circularity"] = circularity;
+                cand["isOverlapping"] = false;
+                cand["accepted"] = false;
+                cand["reason"] = "Circularity too low";
+                cand["markers"] = nlohmann::json::array();
+                candidates.push_back(cand);
+                continue;
+            }
+
+            // Process contour passing circularity threshold using moments centroid tracking
             cv::Moments m = cv::moments(contour);
             if (m.m00 > 0.0) {
                 cv::Point2d momentsCentroid(m.m10 / m.m00, m.m01 / m.m00);

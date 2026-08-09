@@ -27,8 +27,8 @@
 
 // --- C++20 Concept definitions (mirror the interface contracts) ---
 template<typename T>
-concept CTriggerDetector = requires(T t, const cv::Mat& f) {
-    { t.checkOpticalGate(f) } -> std::same_as<bool>;
+concept CTriggerDetector = requires(T t, const cv::Mat& f1, const cv::Mat& f2) {
+    { t.checkTrigger(f1, f2) } -> std::same_as<bool>;
     t.reset();
 };
 
@@ -131,9 +131,9 @@ public:
 
         nlohmann::json trigDiag;
 
-        // 1. If not currently in a shot, monitor the optical gate for trigger event
+        // 1. If not currently in a shot, monitor the trigger detector for trigger event
         if (!inShot) {
-            if (trigger.checkOpticalGate(leftFrame)) {
+            if (trigger.checkTrigger(leftFrame, rightFrame)) {
                 inShot = true;
                 trajectoryBuffer.clear();
                 recordedFrameCount = 0;

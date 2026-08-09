@@ -25,6 +25,7 @@
 #include "Math/AtomicRingBuffer.hpp"
 #include "Math/ITriggerDetector.hpp"
 #include "Math/OpticalGateTrigger.hpp"
+#include "Math/BallPresenceTrigger.hpp"
 #include "Math/IComputerVision.hpp"
 #include "Math/OpenCVMomentsTracker.hpp"
 #include "Math/ISpatialSolver.hpp"
@@ -47,11 +48,15 @@ void runCameraDebugViewer();
 void runReplayViewer(const std::string& replayDir);
 
 int main(int argc, char* argv[]) {
-    // Parse replay argument if provided: --replay <dir> or -r <dir>
+    // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if ((arg == "--replay" || arg == "-r") && i + 1 < argc) {
             runReplayViewer(argv[i + 1]);
+            return 0;
+        }
+        if (arg == "--live" || arg == "-l") {
+            runCameraDebugViewer();
             return 0;
         }
     }
@@ -164,9 +169,10 @@ int main(int argc, char* argv[]) {
     // - Stereo Triangulator (Uses default horizontal calibration)
     // - Kinematics physics engine
     // - Local network TCP transmitter (Target loopback, port 9002)
-    cv::Rect triggerRoi(100, 100, 400, 400);
-    auto trigger = OpticalGateTrigger(triggerRoi, 150, 25, 0.05);
-    auto vision = OpenCVMomentsTracker(80, 240, 80.0, 2500.0, 0.5);
+    // Ball Presence Trigger: tee-area ROI calibrated from live camera view, 30-frame stability lock (~1s)
+    cv::Rect teeRoi(400, 460, 160, 160);
+    auto trigger = BallPresenceTrigger(teeRoi, 30);
+    auto vision = OpenCVMomentsTracker(120, 240, 80.0, 2500.0, 0.5);
     auto spatial = StereoTriangulator();
     auto kinematics = EigenBallisticsEngine();
     auto network = TcpJsonTransmitter("127.0.0.1", 9002);

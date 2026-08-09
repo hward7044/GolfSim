@@ -1,0 +1,428 @@
+@startuml ClassDiagram
+skinparam classAttributeIconSize 0
+skinparam monochrome false
+skinparam packageStyle rectangle
+skinparam shadowing false
+
+package "Camera System" {
+    enum CameraRole {
+        STEREO_LEFT
+        STEREO_RIGHT
+        COUNT
+    }
+
+    class FrameSet {
+        + timestamp : uint64_t
+        + frames : std::array<cv::Mat, CAMERA_ROLE_COUNT>
+        + getFrame(role: CameraRole) : cv::Mat
+        + getFrame(role: CameraRole) : const cv::Mat
+        + preallocate(width: uint32_t, height: uint32_t) : void
+    }
+
+    interface ICameraNode {
+        + {abstract} captureFrame(destination: cv::Mat) : bool
+        + {abstract} getRole() : CameraRole
+        + shutdown() : void
+    }
+
+    class OV9281CameraNode {
+        - usbDriver : std::unique_ptr<IUsbVideoDriver>
+        - role_ : CameraRole
+        - enableHardwareStrobeMode() : void
+        + OV9281CameraNode(driver: std::unique_ptr<IUsbVideoDriver>, role: CameraRole)
+        + captureFrame(destination: cv::Mat) : bool
+        + getRole() : CameraRole
+        + shutdown() : void
+    }
+
+    class PlaybackCameraNode {
+        - mockFilePath : std::string
+        + captureFrame(destination: cv::Mat) : bool
+        + getRole() : CameraRole
+    }
+
+    interface ICameraSystem {
+        + {abstract} captureSynchronizedFrames(frameSet: FrameSet) : bool
+        + shutdown() : void
+    }
+
+    class HardwareSyncedCameraSystem {
+        - cameras : std::vector<std::shared_ptr<ICameraNode>>
+        + captureSynchronizedFrames(frameSet: FrameSet) : bool
+        + addCameraNode(camera: std::shared_ptr<ICameraNode>) : void
+        + shutdown() : void
+    }
+}
+
+package "Hardware Abstraction Layer" {
+    interface IUsbVideoDriver {
+        + {abstract} grabRawFrame(destination: cv::Mat) : bool
+        + {abstract} setHardwareExposure(microseconds: int) : void
+        + {abstract} injectImmediateRegisterWrite(reg: uint16_t, value: uint8_t) : void
+        + shutdown() : void
+    }
+
+    class MediaFoundationDriver {
+        - deviceIndex_ : uint32_t
+        - initialized_ : bool
+        - comInitializedByUs_ : bool
+        - mfInitializedByUs_ : bool
+        - mediaSource_ : ComPtr<IMFMediaSource>
+        - sourceReader_ : ComPtr<IMFSourceReader>
+        - ksControl_ : ComPtr<IKsControl>
+        - xuNodeId_ : DWORD
+        - cachedKspNode_ : KSP_NODE
+        - frameWidth_ : uint32_t
+        - frameHeight_ : uint32_t
+        - frameStride_ : int32_t
+        - isNV12_ : bool
+        - initializeMediaFoundation() : bool
+        - enumerateAndOpenDevice() : bool
+        - configureSourceReader() : bool
+        - discoverExtensionUnit() : bool
+        - configureTriggerAndExposureSettings() : void
+        + MediaFoundationDriver(deviceIndex: uint32_t)
+        + initialize() : bool
+        + shutdown() : void
+        + isInitialized() : bool
+        + getFrameWidth() : uint32_t
+        + getFrameHeight() : uint32_t
+        + {static} logConnectedDevices() : void
+        + grabRawFrame(destination: cv::Mat) : bool
+        + setHardwareExposure(microseconds: int) : void
+        + injectImmediateRegisterWrite(reg: uint16_t, value: uint8_t) : void
+    }
+
+    class V4L2Driver {
+        - fileDescriptor : int
+        + grabRawFrame(destination: cv::Mat) : bool
+        + setHardwareExposure(microseconds: int) : void
+        + injectImmediateRegisterWrite(reg: uint16_t, value: uint8_t) : void
+    }
+
+    class Win32Serial {
+        - hSerial_ : HANDLE
+        - portName_ : std::string
+        - baudRate_ : int
+        + Win32Serial()
+        + open(portName: std::string, baudRate: int) : bool
+        + close() : void
+        + writeString(data: std::string) : bool
+        + isOpen() : bool
+    }
+
+    enum OV9281Reg {
+        EXPOSURE_HI
+        EXPOSURE_MID
+        EXPOSURE_LO
+        GAIN_HI
+        GAIN_LO
+        VTS_HI
+        VTS_LO
+        VSYNC_DELAY_1
+        VSYNC_DELAY_2
+        VSYNC_DELAY_3
+        VSYNC_WIDTH_1
+        VSYNC_WIDTH_2
+        STREAM_ON
+    }
+}
+
+package "Diagnostics" {
+    enum LogLevel {
+        INFO_LEVEL
+        ERROR_LEVEL
+    }
+
+    class GlobalLogger {
+        - asyncQueue : std::shared_ptr<spdlog::details::thread_pool>
+        - {static} instance : GlobalLogger*
+        - GlobalLogger()
+        + {static} getInstance() : GlobalLogger*
+        + logInfo(msg: std::string) : void
+        + logError(msg: std::string) : void
+        + setLevel(level: LogLevel) : void
+    }
+
+    interface IDiagnosticProvider {
+        + {abstract} getLatestDiagnostics() : nlohmann::json
+    }
+
+    class RecordedFrame <<struct>> {
+        + timestamp : uint64_t
+        + leftFrame : cv::Mat
+        + rightFrame : cv::Mat
+        + triggerDiag : nlohmann::json
+        + leftVisionDiag : nlohmann::json
+        + rightVisionDiag : nlohmann::json
+        + triangulatedBalls : std::vector<Ball3D>
+    }
+
+    class FlightRecorder {
+        - outputDirectory : std::string
+        - taskQueue : std::queue<SaveTask>
+        - queueMutex : std::mutex
+        - cvQueue : std::condition_variable
+        - workerThread : std::thread
+        - stopWorker : std::atomic<bool>
+        - workerLoop() : void
+        - enforceLimit() : void
+        - processSaveTask(task: SaveTask) : void
+        + FlightRecorder(outDir: std::string)
+        + saveSession(frames: std::vector<RecordedFrame>, launchData: LaunchData) : void
+    }
+}
+
+package "Math and Vision Pipeline" {
+    class Quantity<Tag, T> {
+        - val_ : T
+        + Quantity()
+        + Quantity(val: T)
+        + value() : T
+    }
+
+    class LaunchData<AngleUnit, SpeedUnit> <<struct>> {
+        + ballSpeed : SpeedUnit
+        + verticalLaunchAngle : AngleUnit
+        + horizontalLaunchAngle : AngleUnit
+        + spinRPM : double
+        + spinAxis : Eigen::Vector3d
+    }
+
+    interface IBufferManager<T> {
+        + {abstract} push(item: T) : void
+        + {abstract} pop() : std::optional<T>
+    }
+
+    class AtomicRingBuffer<T, N> {
+        - buffer : std::array<T, N>
+        - head : std::atomic<size_t>
+        - tail : std::atomic<size_t>
+        + push(item: T) : void
+        + pop() : std::optional<T>
+    }
+
+    interface ITriggerDetector {
+        + {abstract} checkTrigger(leftFrame: cv::Mat, rightFrame: cv::Mat) : bool
+        + checkOpticalGate(currentFrame: cv::Mat) : bool
+        + {abstract} reset() : void
+    }
+
+    enum StereoTriggerState {
+        SEARCHING
+        ARMED
+        CONFIRMING
+        CAPTURED
+    }
+
+    class StereoBallTrackerTrigger {
+        - calib_ : StereoCalibration
+        - state_ : StereoTriggerState
+        - lastKnown3DPos_ : Eigen::Vector3d
+        - lastKnownLeft2D_ : cv::Point2d
+        - lastKnownRight2D_ : cv::Point2d
+        - graceCounter_ : int
+        - confirmFrames_ : int
+        - impactVelocityThreshold_ : double
+        - motionDisplacementThreshold_ : double
+        + StereoBallTrackerTrigger(calib: StereoCalibration, searchRoiLeft: cv::Rect, searchRoiRight: cv::Rect)
+        + checkTrigger(leftFrame: cv::Mat, rightFrame: cv::Mat) : bool
+        + checkOpticalGate(currentFrame: cv::Mat) : bool
+        + reset() : void
+        + getState() : StereoTriggerState
+        + getLastKnown3DPosition() : Eigen::Vector3d
+        + getLatestDiagnostics() : nlohmann::json
+    }
+
+    class OpticalGateTrigger {
+        - gateROI : cv::Rect
+        - backgroundRef : cv::Mat
+        - backgroundRef8U : cv::Mat
+        - grayRoi : cv::Mat
+        - diff8U : cv::Mat
+        - thresh : cv::Mat
+        - currentRoiFloat : cv::Mat
+        - minBallPixels : int
+        - pixelDiffThreshold : int
+        - alpha : double
+        - latestDiag : nlohmann::json
+        + OpticalGateTrigger(roi: cv::Rect, minPixels: int, threshold: int, alphaVal: double)
+        + checkOpticalGate(currentFrame: cv::Mat) : bool
+        + reset() : void
+        + getLatestDiagnostics() : nlohmann::json
+    }
+
+    class MarkerObservation <<struct>> {
+        + position : cv::Point2d
+        + intensity : double
+    }
+
+    class BallObservation <<struct>> {
+        + centroid : cv::Point2d
+        + boundingBox : cv::Rect
+        + markers : std::vector<MarkerObservation>
+    }
+
+    interface IComputerVision {
+        + {abstract} detectBalls(frame: cv::Mat) : std::vector<BallObservation>
+    }
+
+    class OpenCVMomentsTracker {
+        - ballThreshold_ : int
+        - markerThreshold_ : int
+        - minBallArea_ : double
+        - maxBallArea_ : double
+        - minBallCircularity_ : double
+        - gray_ : cv::Mat
+        - ballMask_ : cv::Mat
+        - localRegion_ : cv::Mat
+        - localRegionBlurred_ : cv::Mat
+        - thresh_ : cv::Mat
+        - latestDiag : nlohmann::json
+        - extractMarkersInROI(gray: cv::Mat, roi: cv::Rect, markerThreshold: int) : std::vector<MarkerObservation>
+        + OpenCVMomentsTracker(ballThresh: int, markerThresh: int, minBAr: double, maxBAr: double, minBCirc: double)
+        + detectBalls(frame: cv::Mat) : std::vector<BallObservation>
+        + getLatestDiagnostics() : nlohmann::json
+    }
+
+    class Marker3D <<struct>> {
+        + position : Eigen::Vector3d
+        + confidence : double
+        + isStereo : bool
+    }
+
+    class Ball3D <<struct>> {
+        + centroid : Eigen::Vector3d
+        + markers : std::vector<Marker3D>
+    }
+
+    interface ISpatialSolver {
+        + {abstract} triangulateShot(leftObs: std::vector<BallObservation>, rightObs: std::vector<BallObservation>) : std::vector<Ball3D>
+    }
+
+    class StereoCalibration <<struct>> {
+        + K_L : cv::Mat
+        + D_L : cv::Mat
+        + K_R : cv::Mat
+        + D_R : cv::Mat
+        + R : cv::Mat
+        + T : cv::Mat
+        + R_L : cv::Mat
+        + R_R : cv::Mat
+        + P_L : cv::Mat
+        + P_R : cv::Mat
+        + Q : cv::Mat
+    }
+
+    class StereoTriangulator {
+        - calib_ : StereoCalibration
+        - ballRadius_ : double
+        - pt2D_L_ : cv::Mat
+        - pt2D_R_ : cv::Mat
+        - undL_ : cv::Mat
+        - undR_ : cv::Mat
+        - pt4D_ : cv::Mat
+        - pt_temp_ : cv::Mat
+        - und_temp_ : cv::Mat
+        + StereoTriangulator()
+        + StereoTriangulator(calib: StereoCalibration, ballRadius: double)
+        + setCalibration(calib: StereoCalibration) : void
+        + triangulateShot(leftObs: std::vector<BallObservation>, rightObs: std::vector<BallObservation>) : std::vector<Ball3D>
+    }
+
+    interface IKinematicsSolver {
+        + {abstract} solveKinematics(trajectory: std::vector<Ball3D>, pulseIntervalMs: double) : LaunchData
+    }
+
+    class EigenBallisticsEngine {
+        + solveKinematics(trajectory: std::vector<Ball3D>, pulseIntervalMs: double) : LaunchData
+    }
+
+    interface INetworkTransmitter {
+        + {abstract} transmitLaunchData(data: LaunchData) : bool
+    }
+
+    class TcpJsonTransmitter {
+        - ip_ : std::string
+        - port_ : int
+        - socket_ : SocketType
+        - connected_ : bool
+        - connectToServer() : bool
+        - disconnect() : void
+        + TcpJsonTransmitter(ip: std::string, port: int)
+        + transmitLaunchData(data: LaunchData) : bool
+    }
+}
+
+package "Orchestration" {
+    class SessionStateMachine<Trigger, Vision, Spatial, Kinematics, Net> {
+        - trigger : Trigger
+        - vision : Vision
+        - spatial : Spatial
+        - kinematics : Kinematics
+        - network : Net
+        - recorder : FlightRecorder
+        - trajectoryBuffer : std::vector<Ball3D>
+        - recordedFramesPool : std::vector<RecordedFrame>
+        - recordedFrameCount : size_t
+        - emptyFrameCount : int
+        - inShot : bool
+        - getTelemetry(obj: T) : nlohmann::json
+        - saveToShotHistory(data: LaunchData) : void
+        + SessionStateMachine(t: Trigger, v: Vision, s: Spatial, k: Kinematics, n: Net)
+        + processNextFrame(set: FrameSet) : void
+    }
+
+    class ThreadManager {
+        - cameraSystem : std::shared_ptr<ICameraSystem>
+        - buffer : std::shared_ptr<IBufferManager>
+        - stateMachine : std::shared_ptr<ConcreteSSM>
+        - serial_ : Win32Serial
+        - running_ : std::atomic<bool>
+        - producerThread_ : std::jthread
+        - consumerThread_ : std::jthread
+        + ThreadManager(camSys: std::shared_ptr<ICameraSystem>, buf: std::shared_ptr<IBufferManager>, sm: std::shared_ptr<ConcreteSSM>)
+        + startProducerThread() : void
+        + startConsumerThread() : void
+        + stop() : void
+    }
+}
+
+' Relationships & Realizations
+ICameraNode <|.. OV9281CameraNode
+ICameraNode <|.. PlaybackCameraNode
+ICameraSystem <|.. HardwareSyncedCameraSystem
+HardwareSyncedCameraSystem o-- ICameraNode
+
+IUsbVideoDriver <|.. MediaFoundationDriver
+IUsbVideoDriver <|.. V4L2Driver
+OV9281CameraNode --> IUsbVideoDriver
+
+IDiagnosticProvider <|.. OpticalGateTrigger
+IDiagnosticProvider <|.. OpenCVMomentsTracker
+
+ITriggerDetector <|.. OpticalGateTrigger
+IComputerVision <|.. OpenCVMomentsTracker
+ISpatialSolver <|.. StereoTriangulator
+IKinematicsSolver <|.. EigenBallisticsEngine
+INetworkTransmitter <|.. TcpJsonTransmitter
+
+IBufferManager <|.. AtomicRingBuffer
+
+StereoTriangulator *-- StereoCalibration
+
+BallObservation *-- MarkerObservation
+Ball3D *-- Marker3D
+
+SessionStateMachine *-- FlightRecorder
+SessionStateMachine ..> FrameSet
+RecordedFrame *-- Ball3D
+FlightRecorder ..> RecordedFrame
+FlightRecorder ..> LaunchData
+
+ThreadManager --> ICameraSystem
+ThreadManager --> IBufferManager
+ThreadManager --> SessionStateMachine
+ThreadManager --> Win32Serial
+
+@enduml
