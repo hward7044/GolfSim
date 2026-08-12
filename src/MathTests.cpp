@@ -1,5 +1,4 @@
 #include "Math/Units.hpp"
-#include "Math/OpticalGateTrigger.hpp"
 #include "Math/BallPresenceTrigger.hpp"
 #include "Math/StereoBallTrackerTrigger.hpp"
 #include "Math/OpenCVMomentsTracker.hpp"
@@ -364,10 +363,10 @@ void testStereoBallTrackerTrigger() {
     calib.P_L = (cv::Mat_<double>(3, 4) << 1000.0, 0.0, 640.0, 0.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0);
     calib.P_R = (cv::Mat_<double>(3, 4) << 1000.0, 0.0, 640.0, -100.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0);
 
-    // Instantiate tracker with wide search ROI and 2ft parameters
+    // Instantiate tracker with wide search ROI, 5-frame stability lock, and 3ft (0.9144m) limit
     cv::Rect searchRoiL(400, 200, 480, 400);
     cv::Rect searchRoiR(400, 200, 480, 400);
-    StereoBallTrackerTrigger trigger(calib, searchRoiL, searchRoiR, 25.0, 50.0, 0.60, 100, 3.0, 256, 4, 4.0, 0.04);
+    StereoBallTrackerTrigger trigger(calib, searchRoiL, searchRoiR, 5.0, 50.0, 0.50, 100, 30.0, 256, 0.9144, 5, 4, 4.0, 0.04);
 
     // Frame setup for ball at (0, 0, 0.6) m (2 ft distance)
     // f = 1000, B = 0.1m => Disparity d = (f * B) / Z = 100 / 0.6 = 166.67 px
@@ -378,9 +377,28 @@ void testStereoBallTrackerTrigger() {
     cv::circle(frameL, cv::Point(640, 400), 35, cv::Scalar(200), -1);
     cv::circle(frameR, cv::Point(473, 400), 35, cv::Scalar(200), -1);
 
-    // 1. Test SEARCHING -> ARMED Transition
-    bool trig1 = trigger.checkTrigger(frameL, frameR);
-    assert(!trig1);
+    // 0. Test 3FT DISTANCE REJECTION (Ball placed at Z = 1.0m / 3.28 ft > 3.0 ft)
+    // f = 1000, B = 0.1m => d = 100/1.0 = 100 px => Right center = 640 - 100 = 540
+    cv::Mat farFrameL = cv::Mat::zeros(800, 1280, CV_8UC1);
+    cv::Mat farFrameR = cv::Mat::zeros(800, 1280, CV_8UC1);
+    cv::circle(farFrameL, cv::Point(640, 400), 21, cv::Scalar(200), -1);
+    cv::circle(farFrameR, cv::Point(540, 400), 21, cv::Scalar(200), -1);
+
+    for (int i = 0; i < 6; ++i) {
+        bool trigFar = trigger.checkTrigger(farFrameL, farFrameR);
+        assert(!trigFar);
+        assert(trigger.getState() == StereoTriggerState::SEARCHING);
+    }
+
+    // 1. Test SEARCHING -> ARMED Transition (Requires 5 consecutive stable frames)
+    for (int i = 0; i < 4; ++i) {
+        bool trigSearch = trigger.checkTrigger(frameL, frameR);
+        assert(!trigSearch);
+        assert(trigger.getState() == StereoTriggerState::SEARCHING);
+    }
+    // 5th frame transitions state to ARMED
+    bool trigArmed = trigger.checkTrigger(frameL, frameR);
+    assert(!trigArmed);
     assert(trigger.getState() == StereoTriggerState::ARMED);
     auto pos3D = trigger.getLastKnown3DPosition();
     assert(std::abs(pos3D.z() - 0.6) < 0.02);
@@ -404,8 +422,10 @@ void testStereoBallTrackerTrigger() {
     assert(!trigReset);
     assert(trigger.getState() == StereoTriggerState::SEARCHING);
 
-    // Re-lock ball to ARMED
-    trigger.checkTrigger(frameL, frameR);
+    // Re-lock ball to ARMED (requires 5 frames)
+    for (int i = 0; i < 5; ++i) {
+        trigger.checkTrigger(frameL, frameR);
+    }
     assert(trigger.getState() == StereoTriggerState::ARMED);
 
     // 4. Test VIBRATION / NUDGE REJECTION

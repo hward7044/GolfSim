@@ -36,41 +36,17 @@ void ThreadManager::startProducerThread() {
         // Pre-allocate frame buffers (OV9281 resolution: 1280x800)
         frameSet.preallocate(1280, 800);
 
-        // Optical gate trigger helper for idle detection
-        OpticalGateTrigger gateTrigger;
-
-        // Cooldown timer to prevent rapid double-triggering
-        auto lastTriggerTime = std::chrono::steady_clock::now() - std::chrono::seconds(5);
-
         while (!stopToken.stop_requested() && running_) {
             if (!cameraSystem) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
 
-            // Capture frames continuously from the always-triggered cameras
+            // Capture frames continuously from synchronized cameras
             if (cameraSystem->captureSynchronizedFrames(frameSet)) {
-                // Buffer the captured FrameSet
+                // Buffer the captured FrameSet for consumer state machine processing
                 if (buffer) {
                     buffer->push(frameSet);
-                }
-
-                // Check optical gate trigger using the left camera frame
-                cv::Mat leftFrame = frameSet.getFrame(CameraRole::STEREO_LEFT);
-                if (!leftFrame.empty()) {
-                    if (gateTrigger.checkOpticalGate(leftFrame)) {
-                        auto now = std::chrono::steady_clock::now();
-                        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastTriggerTime).count() >= 2) {
-                            spdlog::info("[ThreadManager] Optical gate triggered! Dispatching MCU serial FIRE signal.");
-#ifdef _WIN32
-                            if (serial_.isOpen()) {
-                                serial_.writeString("FIRE\n");
-                            }
-#endif
-                            lastTriggerTime = now;
-                            gateTrigger.reset();
-                        }
-                    }
                 }
             } else {
                 // If frame capture is waiting on external triggers (MCU low-rate idle),

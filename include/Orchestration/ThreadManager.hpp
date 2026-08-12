@@ -1,7 +1,7 @@
 #pragma once
 #include "Camera/ICameraSystem.hpp"
 #include "Math/IBufferManager.hpp"
-#include "Math/OpticalGateTrigger.hpp"
+#include "Math/StereoBallTrackerTrigger.hpp"
 #include "Math/BallPresenceTrigger.hpp"
 #include "Math/OpenCVMomentsTracker.hpp"
 #include "Math/StereoTriangulator.hpp"
@@ -17,7 +17,7 @@
 // Concrete instantiation of SessionStateMachine for the production hot-path.
 // Static dispatch — zero virtual call overhead.
 using ConcreteSSM = SessionStateMachine<
-    BallPresenceTrigger,
+    StereoBallTrackerTrigger,
     OpenCVMomentsTracker,
     StereoTriangulator,
     EigenBallisticsEngine,

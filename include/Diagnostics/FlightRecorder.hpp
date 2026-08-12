@@ -53,4 +53,8 @@ public:
         const std::vector<RecordedFrame>& frames,
         const LaunchData<Degrees, MilesPerHour>& launchData
     );
+
+    void saveStreamSession(
+        const std::vector<RecordedFrame>& frames
+    );
 };

@@ -109,6 +109,93 @@ void FlightRecorder::saveSession(
     cvQueue.notify_one();
 }
 
+void FlightRecorder::saveStreamSession(
+    const std::vector<RecordedFrame>& frames
+) {
+    if (frames.empty()) {
+        spdlog::warn("[FlightRecorder] Attempted to save empty stream session, ignoring.");
+        return;
+    }
+
+    auto now = std::chrono::system_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    auto timer = std::chrono::system_clock::to_time_t(now);
+    std::tm bt;
+#ifdef _MSC_VER
+    localtime_s(&bt, &timer);
+#else
+    localtime_r(&timer, &bt);
+#endif
+
+    std::ostringstream ssFolder;
+    ssFolder << "stream_"
+             << std::setfill('0')
+             << std::setw(4) << (bt.tm_year + 1900)
+             << std::setw(2) << (bt.tm_mon + 1)
+             << std::setw(2) << bt.tm_mday << "_"
+             << std::setw(2) << bt.tm_hour
+             << std::setw(2) << bt.tm_min
+             << std::setw(2) << bt.tm_sec << "_"
+             << std::setw(3) << ms.count();
+
+    std::filesystem::path replayPath = std::filesystem::path(outputDirectory) / ssFolder.str();
+    std::filesystem::path rawPath = replayPath / "raw";
+    std::filesystem::path annotatedPath = replayPath / "annotated";
+
+    try {
+        std::filesystem::create_directories(rawPath);
+        std::filesystem::create_directories(annotatedPath);
+    } catch (const std::exception& e) {
+        spdlog::error("[FlightRecorder] Failed to create directories for stream session: {}", e.what());
+        return;
+    }
+
+    nlohmann::json jMeta;
+    jMeta["sessionType"] = "stream";
+    jMeta["timestamp"] = ssFolder.str();
+    jMeta["frameCount"] = frames.size();
+
+    nlohmann::json jFrames = nlohmann::json::array();
+
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const auto& f = frames[i];
+
+        std::ostringstream ssIdx;
+        ssIdx << std::setfill('0') << std::setw(3) << i;
+        std::string filenameLeft = "left_" + ssIdx.str() + ".png";
+        std::string filenameRight = "right_" + ssIdx.str() + ".png";
+
+        if (!f.leftFrame.empty()) {
+            cv::imwrite((rawPath / filenameLeft).string(), f.leftFrame);
+        }
+        if (!f.rightFrame.empty()) {
+            cv::imwrite((rawPath / filenameRight).string(), f.rightFrame);
+        }
+
+        nlohmann::json jFrame;
+        jFrame["index"] = i;
+        jFrame["timestamp"] = f.timestamp;
+        jFrame["rawLeft"] = filenameLeft;
+        jFrame["rawRight"] = filenameRight;
+        jFrame["triggerDiag"] = f.triggerDiag;
+
+        jFrames.push_back(jFrame);
+    }
+
+    jMeta["frames"] = jFrames;
+
+    std::ofstream out((replayPath / "metadata.json").string());
+    if (out.is_open()) {
+        out << jMeta.dump(4);
+        out.close();
+        spdlog::info("[FlightRecorder] Saved stream session directory: {}", replayPath.string());
+    } else {
+        spdlog::error("[FlightRecorder] Failed to write metadata.json to {}", replayPath.string());
+    }
+
+    enforceLimit();
+}
+
 void FlightRecorder::processSaveTask(const SaveTask& task) {
     auto now = std::chrono::system_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;

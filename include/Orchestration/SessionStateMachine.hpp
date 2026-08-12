@@ -68,6 +68,11 @@ private:
     int            emptyFrameCount = 0;
     bool           inShot = false;
 
+    bool           streamRecordingMode = false;
+    int            streamFrameLimit = 50;
+    std::vector<RecordedFrame> streamFramesPool;
+    size_t         streamFrameCount = 0;
+
     template<typename T>
     nlohmann::json getTelemetry(const T& obj) {
         if constexpr (requires { obj.getLatestDiagnostics(); }) {
@@ -121,6 +126,19 @@ public:
         }
     }
 
+    void setStreamRecordingMode(bool enable, int frameLimit = 50) {
+        streamRecordingMode = enable;
+        streamFrameLimit = frameLimit;
+        streamFramesPool.resize(frameLimit);
+        for (auto& rf : streamFramesPool) {
+            rf.leftFrame = cv::Mat(800, 1280, CV_8UC1);
+            rf.rightFrame = cv::Mat(800, 1280, CV_8UC1);
+        }
+        streamFrameCount = 0;
+        spdlog::info("[SessionStateMachine] Stream recording mode {} (Limit: {} frames/chunk)",
+                     enable ? "ENABLED" : "DISABLED", frameLimit);
+    }
+
     void processNextFrame(const FrameSet& set) {
         cv::Mat leftFrame = set.getFrame(CameraRole::STEREO_LEFT);
         cv::Mat rightFrame = set.getFrame(CameraRole::STEREO_RIGHT);
@@ -131,6 +149,30 @@ public:
 
         nlohmann::json trigDiag;
 
+        // If in stream recording mode, buffer frames and write stream chunks to disk without waiting for a shot trigger
+        if (streamRecordingMode) {
+            trigger.checkTrigger(leftFrame, rightFrame);
+            trigDiag = getTelemetry(trigger);
+
+            if (streamFrameCount < streamFramesPool.size()) {
+                auto& rf = streamFramesPool[streamFrameCount];
+                rf.timestamp = set.timestamp;
+                leftFrame.copyTo(rf.leftFrame);
+                rightFrame.copyTo(rf.rightFrame);
+                rf.triggerDiag = trigDiag;
+                streamFrameCount++;
+            }
+
+            if (streamFrameCount >= static_cast<size_t>(streamFrameLimit)) {
+                spdlog::info("[SessionStateMachine] Stream chunk captured ({}/{} frames). Saving to disk...",
+                             streamFrameCount, streamFrameLimit);
+                std::vector<RecordedFrame> streamFrames(streamFramesPool.begin(), streamFramesPool.begin() + streamFrameCount);
+                recorder.saveStreamSession(streamFrames);
+                streamFrameCount = 0;
+            }
+            return;
+        }
+
         // 1. If not currently in a shot, monitor the trigger detector for trigger event
         if (!inShot) {
             if (trigger.checkTrigger(leftFrame, rightFrame)) {
@@ -139,7 +181,7 @@ public:
                 recordedFrameCount = 0;
                 emptyFrameCount = 0;
                 trigDiag = getTelemetry(trigger);
-                spdlog::info("[SessionStateMachine] Optical gate triggered! Starting shot capture...");
+                spdlog::info("[SessionStateMachine] Impact trigger confirmed! Starting shot capture...");
             }
         }
 
