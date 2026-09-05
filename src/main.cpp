@@ -3,10 +3,11 @@
 #include <iomanip>
 #include <iostream>
 #include <nlohmann/json.hpp>
-#include <opencv2/opencv.hpp>
-#if __has_include(<opencv2/geometry.hpp>)
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 #include <opencv2/geometry.hpp>
-#endif
+#include <opencv2/highgui.hpp>
+#include <opencv2/videoio.hpp>
 #include <spdlog/spdlog.h>
 #include <thread>
 

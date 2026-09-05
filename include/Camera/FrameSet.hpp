@@ -1,5 +1,5 @@
 #pragma once
-#include <opencv2/opencv.hpp>
+#include <opencv2/core/mat.hpp>
 #include <array>
 #include <cstdint>
 #include "Camera/CameraRole.hpp"

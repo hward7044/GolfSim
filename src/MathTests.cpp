@@ -8,6 +8,7 @@
 #include "Camera/FrameSet.hpp"
 #include "Diagnostics/FlightRecorder.hpp"
 #include <Eigen/Geometry>
+#include <opencv2/imgproc.hpp>
 #include <spdlog/spdlog.h>
 #include <cassert>
 #include <cmath>
@@ -141,19 +142,19 @@ void testStereoTriangulatorAndRaySphere() {
     StereoCalibration calib;
     // Let's set up a standard horizontal camera setup.
     // Focal length = 1000 pixels. Center = (640, 400).
-    calib.K_L = (cv::Mat_<double>(3, 3) << 1000.0, 0.0, 640.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 1.0);
+    calib.K_L = cv::Mat_<double>({3, 3}, {1000.0, 0.0, 640.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 1.0});
     calib.D_L = cv::Mat::zeros(1, 5, CV_64F);
     calib.K_R = calib.K_L.clone();
     calib.D_R = calib.D_L.clone();
     calib.R = cv::Mat::eye(3, 3, CV_64F);
-    calib.T = (cv::Mat_<double>(3, 1) << -0.1, 0.0, 0.0); // 100mm baseline along X
+    calib.T = cv::Mat_<double>({3, 1}, {-0.1, 0.0, 0.0}); // 100mm baseline along X
 
     calib.R_L = cv::Mat::eye(3, 3, CV_64F);
     calib.R_R = cv::Mat::eye(3, 3, CV_64F);
 
     // Rectification projection matrices
-    calib.P_L = (cv::Mat_<double>(3, 4) << 1000.0, 0.0, 640.0, 0.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0);
-    calib.P_R = (cv::Mat_<double>(3, 4) << 1000.0, 0.0, 640.0, -100.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0);
+    calib.P_L = cv::Mat_<double>({3, 4}, {1000.0, 0.0, 640.0, 0.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0});
+    calib.P_R = cv::Mat_<double>({3, 4}, {1000.0, 0.0, 640.0, -100.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0});
 
     StereoTriangulator solver(calib, 0.021335);
 
@@ -354,16 +355,16 @@ void testFlightRecorder() {
 
 void testStereoBallTrackerTrigger() {
     StereoCalibration calib;
-    calib.K_L = (cv::Mat_<double>(3, 3) << 1000.0, 0.0, 640.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 1.0);
+    calib.K_L = cv::Mat_<double>({3, 3}, {1000.0, 0.0, 640.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 1.0});
     calib.D_L = cv::Mat::zeros(1, 5, CV_64F);
     calib.K_R = calib.K_L.clone();
     calib.D_R = calib.D_L.clone();
     calib.R = cv::Mat::eye(3, 3, CV_64F);
-    calib.T = (cv::Mat_<double>(3, 1) << -0.1, 0.0, 0.0); // 100mm baseline
+    calib.T = cv::Mat_<double>({3, 1}, {-0.1, 0.0, 0.0}); // 100mm baseline
     calib.R_L = cv::Mat::eye(3, 3, CV_64F);
     calib.R_R = cv::Mat::eye(3, 3, CV_64F);
-    calib.P_L = (cv::Mat_<double>(3, 4) << 1000.0, 0.0, 640.0, 0.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0);
-    calib.P_R = (cv::Mat_<double>(3, 4) << 1000.0, 0.0, 640.0, -100.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0);
+    calib.P_L = cv::Mat_<double>({3, 4}, {1000.0, 0.0, 640.0, 0.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0});
+    calib.P_R = cv::Mat_<double>({3, 4}, {1000.0, 0.0, 640.0, -100.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0});
 
     // Instantiate tracker with wide search ROI, 5-frame stability lock, and 3ft (0.9144m) limit
     cv::Rect searchRoiL(400, 200, 480, 400);

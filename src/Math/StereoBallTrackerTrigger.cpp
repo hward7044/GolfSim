@@ -1,7 +1,8 @@
 #include "Math/StereoBallTrackerTrigger.hpp"
 #include <algorithm>
 #include <cmath>
-#include <opencv2/calib3d.hpp>
+#include <opencv2/geometry.hpp>
+#include <opencv2/stereo.hpp>
 #include <opencv2/imgproc.hpp>
 #include <spdlog/spdlog.h>
 
@@ -30,23 +31,22 @@ StereoBallTrackerTrigger::StereoBallTrackerTrigger(
 
   // Populate fallback default calibration if matrices are uninitialized
   if (calib_.K_L.empty()) {
-    calib_.K_L = (cv::Mat_<double>(3, 3) << 1000.0, 0.0, 640.0, 0.0, 1000.0,
-                  400.0, 0.0, 0.0, 1.0);
+    calib_.K_L = cv::Mat_<double>({3, 3}, {1000.0, 0.0, 640.0, 0.0, 1000.0,
+                  400.0, 0.0, 0.0, 1.0});
     calib_.D_L = cv::Mat::zeros(1, 5, CV_64F);
     calib_.K_R = calib_.K_L.clone();
     calib_.D_R = calib_.D_L.clone();
 
     calib_.R = cv::Mat::eye(3, 3, CV_64F);
-    calib_.T =
-        (cv::Mat_<double>(3, 1) << -0.1, 0.0, 0.0); // 100mm baseline along X
+    calib_.T = cv::Mat_<double>({3, 1}, {-0.1, 0.0, 0.0}); // 100mm baseline along X
 
     calib_.R_L = cv::Mat::eye(3, 3, CV_64F);
     calib_.R_R = cv::Mat::eye(3, 3, CV_64F);
 
-    calib_.P_L = (cv::Mat_<double>(3, 4) << 1000.0, 0.0, 640.0, 0.0, 0.0,
-                  1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0);
-    calib_.P_R = (cv::Mat_<double>(3, 4) << 1000.0, 0.0, 640.0, -100.0, 0.0,
-                  1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0);
+    calib_.P_L = cv::Mat_<double>({3, 4}, {1000.0, 0.0, 640.0, 0.0, 0.0,
+                  1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0});
+    calib_.P_R = cv::Mat_<double>({3, 4}, {1000.0, 0.0, 640.0, -100.0, 0.0,
+                  1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0});
   }
 
   spdlog::info("[StereoTrigger] State initialized: SEARCHING for ball...");
@@ -63,17 +63,10 @@ cv::Point2d StereoBallTrackerTrigger::rectifyPoint(const cv::Point2d &pt,
                                                    const cv::Mat &D,
                                                    const cv::Mat &R_rect,
                                                    const cv::Mat &P_rect) {
-  pt_temp_.create(1, 1, CV_64FC2);
-  pt_temp_.at<cv::Vec2d>(0, 0) = cv::Vec2d(pt.x, pt.y);
-  cv::undistortPoints(pt_temp_, und_temp_, K, D, R_rect, P_rect);
-
-  cv::Mat und_double;
-  if (und_temp_.depth() != CV_64F) {
-    und_temp_.convertTo(und_double, CV_64F);
-  } else {
-    und_double = und_temp_;
-  }
-  return cv::Point2d(und_double.at<double>(0, 0), und_double.at<double>(0, 1));
+  std::vector<cv::Point2d> inPts = {pt};
+  std::vector<cv::Point2d> outPts;
+  cv::undistortPoints(inPts, outPts, K, D, R_rect, P_rect);
+  return outPts.empty() ? pt : outPts[0];
 }
 
 bool StereoBallTrackerTrigger::triangulateCentroid(const cv::Point2d &leftPt,
@@ -103,7 +96,7 @@ bool StereoBallTrackerTrigger::triangulateCentroid(const cv::Point2d &leftPt,
 
 cv::Point2d
 StereoBallTrackerTrigger::project3DToLeft(const Eigen::Vector3d &pt3D) {
-  cv::Mat ptHom = (cv::Mat_<double>(4, 1) << pt3D.x(), pt3D.y(), pt3D.z(), 1.0);
+  cv::Mat ptHom = cv::Mat_<double>({4, 1}, {pt3D.x(), pt3D.y(), pt3D.z(), 1.0});
   cv::Mat proj = calib_.P_L * ptHom;
   double w = proj.at<double>(2, 0);
   if (std::abs(w) < 1e-6)
@@ -113,7 +106,7 @@ StereoBallTrackerTrigger::project3DToLeft(const Eigen::Vector3d &pt3D) {
 
 cv::Point2d
 StereoBallTrackerTrigger::project3DToRight(const Eigen::Vector3d &pt3D) {
-  cv::Mat ptHom = (cv::Mat_<double>(4, 1) << pt3D.x(), pt3D.y(), pt3D.z(), 1.0);
+  cv::Mat ptHom = cv::Mat_<double>({4, 1}, {pt3D.x(), pt3D.y(), pt3D.z(), 1.0});
   cv::Mat proj = calib_.P_R * ptHom;
   double w = proj.at<double>(2, 0);
   if (std::abs(w) < 1e-6)

@@ -1,5 +1,5 @@
 #pragma once
-#include <opencv2/opencv.hpp>
+#include <opencv2/core/mat.hpp>
 #include "Camera/CameraRole.hpp"
 class ICameraNode {
 public:

@@ -1,25 +1,26 @@
 #include "Math/StereoTriangulator.hpp"
-#include <opencv2/calib3d.hpp>
+#include <opencv2/geometry.hpp>
+#include <opencv2/stereo.hpp>
 #include <algorithm>
 #include <cmath>
 
 StereoTriangulator::StereoTriangulator() : ballRadius_(0.021335) {
     // Default calibration parameters mapping to a horizontal stereo setup with 100mm baseline
-    calib_.K_L = (cv::Mat_<double>(3, 3) << 1000.0, 0.0, 640.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 1.0);
+    calib_.K_L = cv::Mat_<double>({3, 3}, {1000.0, 0.0, 640.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 1.0});
     calib_.D_L = cv::Mat::zeros(1, 5, CV_64F);
     
     calib_.K_R = calib_.K_L.clone();
     calib_.D_R = calib_.D_L.clone();
 
     calib_.R = cv::Mat::eye(3, 3, CV_64F);
-    calib_.T = (cv::Mat_<double>(3, 1) << -0.1, 0.0, 0.0); // 100mm baseline along X
+    calib_.T = cv::Mat_<double>({3, 1}, {-0.1, 0.0, 0.0}); // 100mm baseline along X
 
     calib_.R_L = cv::Mat::eye(3, 3, CV_64F);
     calib_.R_R = cv::Mat::eye(3, 3, CV_64F);
 
     // Identity projection matrices
-    calib_.P_L = (cv::Mat_<double>(3, 4) << 1000.0, 0.0, 640.0, 0.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0);
-    calib_.P_R = (cv::Mat_<double>(3, 4) << 1000.0, 0.0, 640.0, -100.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0);
+    calib_.P_L = cv::Mat_<double>({3, 4}, {1000.0, 0.0, 640.0, 0.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0});
+    calib_.P_R = cv::Mat_<double>({3, 4}, {1000.0, 0.0, 640.0, -100.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0});
 }
 
 StereoTriangulator::StereoTriangulator(const StereoCalibration& calib, double ballRadius)
@@ -29,40 +30,29 @@ void StereoTriangulator::setCalibration(const StereoCalibration& calib) {
     calib_ = calib;
 }
 
-static Eigen::Vector3d toEigenVec(const cv::Mat& m) {
-    return Eigen::Vector3d(m.at<double>(0, 0), m.at<double>(1, 0), m.at<double>(2, 0));
-}
-
-static cv::Point2d getPointDouble(const cv::Mat& m) {
-    cv::Mat m_double;
-    if (m.depth() != CV_64F) {
-        m.convertTo(m_double, CV_64F);
-    } else {
-        m_double = m;
-    }
-    return cv::Point2d(m_double.at<double>(0, 0), m_double.at<double>(0, 1));
-}
-
 std::vector<Ball3D> StereoTriangulator::triangulateShot(
     const std::vector<BallObservation>& leftObs,
     const std::vector<BallObservation>& rightObs
 ) {
     std::vector<Ball3D> trajectory;
 
-    // 1. Rectify and project all ball centroids to rectified space
-    std::vector<cv::Point2d> rectLeft(leftObs.size());
-    pt_temp_.create(1, 1, CV_64FC2);
-    for (std::size_t i = 0; i < leftObs.size(); ++i) {
-        pt_temp_.at<cv::Vec2d>(0, 0) = cv::Vec2d(leftObs[i].centroid.x, leftObs[i].centroid.y);
-        cv::undistortPoints(pt_temp_, und_temp_, calib_.K_L, calib_.D_L, calib_.R_L, calib_.P_L);
-        rectLeft[i] = getPointDouble(und_temp_);
+    // 1. Rectify and project all ball centroids to rectified space via OpenCV 5 batch SIMD
+    std::vector<cv::Point2d> rectLeft;
+    if (!leftObs.empty()) {
+        std::vector<cv::Point2d> leftPts(leftObs.size());
+        for (std::size_t i = 0; i < leftObs.size(); ++i) {
+            leftPts[i] = leftObs[i].centroid;
+        }
+        cv::undistortPoints(leftPts, rectLeft, calib_.K_L, calib_.D_L, calib_.R_L, calib_.P_L);
     }
 
-    std::vector<cv::Point2d> rectRight(rightObs.size());
-    for (std::size_t j = 0; j < rightObs.size(); ++j) {
-        pt_temp_.at<cv::Vec2d>(0, 0) = cv::Vec2d(rightObs[j].centroid.x, rightObs[j].centroid.y);
-        cv::undistortPoints(pt_temp_, und_temp_, calib_.K_R, calib_.D_R, calib_.R_R, calib_.P_R);
-        rectRight[j] = getPointDouble(und_temp_);
+    std::vector<cv::Point2d> rectRight;
+    if (!rightObs.empty()) {
+        std::vector<cv::Point2d> rightPts(rightObs.size());
+        for (std::size_t j = 0; j < rightObs.size(); ++j) {
+            rightPts[j] = rightObs[j].centroid;
+        }
+        cv::undistortPoints(rightPts, rectRight, calib_.K_R, calib_.D_R, calib_.R_R, calib_.P_R);
     }
 
     // 2. Sort indices horizontally (downrange along X) to preserve chronological path structure
@@ -117,16 +107,13 @@ std::vector<Ball3D> StereoTriangulator::triangulateShot(
         const auto& bL = leftObs[match.first];
         const auto& bR = rightObs[match.second];
 
-        // Triangulate ball centroid
+        // Triangulate ball centroid using already-rectified coordinates
         pt2D_L_.create(1, 1, CV_64FC2);
-        pt2D_L_.at<cv::Vec2d>(0, 0) = cv::Vec2d(bL.centroid.x, bL.centroid.y);
+        pt2D_L_.at<cv::Vec2d>(0, 0) = cv::Vec2d(rectLeft[match.first].x, rectLeft[match.first].y);
         pt2D_R_.create(1, 1, CV_64FC2);
-        pt2D_R_.at<cv::Vec2d>(0, 0) = cv::Vec2d(bR.centroid.x, bR.centroid.y);
+        pt2D_R_.at<cv::Vec2d>(0, 0) = cv::Vec2d(rectRight[match.second].x, rectRight[match.second].y);
 
-        cv::undistortPoints(pt2D_L_, undL_, calib_.K_L, calib_.D_L, calib_.R_L, calib_.P_L);
-        cv::undistortPoints(pt2D_R_, undR_, calib_.K_R, calib_.D_R, calib_.R_R, calib_.P_R);
-
-        cv::triangulatePoints(calib_.P_L, calib_.P_R, undL_, undR_, pt4D_);
+        cv::triangulatePoints(calib_.P_L, calib_.P_R, pt2D_L_, pt2D_R_, pt4D_);
         double w = pt4D_.at<double>(3, 0);
         if (std::abs(w) < 1e-6) continue;
 
@@ -143,22 +130,33 @@ std::vector<Ball3D> StereoTriangulator::triangulateShot(
         std::vector<bool> rightMarkerUsed(bR.markers.size(), false);
         std::vector<Marker3D> markers3D;
 
-        // Prep Right camera marker undistorted rectified positions for epipolar matching
+        // Prep Right camera marker undistorted rectified positions for epipolar matching via batch SIMD
         std::vector<cv::Point2d> undMrList;
-        undMrList.reserve(bR.markers.size());
-        for (const auto& mr : bR.markers) {
-            pt_temp_.create(1, 1, CV_64FC2);
-            pt_temp_.at<cv::Vec2d>(0, 0) = cv::Vec2d(mr.position.x, mr.position.y);
-            cv::undistortPoints(pt_temp_, und_temp_, calib_.K_R, calib_.D_R, calib_.R_R, calib_.P_R);
-            undMrList.push_back(getPointDouble(und_temp_));
+        if (!bR.markers.empty()) {
+            std::vector<cv::Point2d> mrPts(bR.markers.size());
+            for (std::size_t k = 0; k < bR.markers.size(); ++k) mrPts[k] = bR.markers[k].position;
+            cv::undistortPoints(mrPts, undMrList, calib_.K_R, calib_.D_R, calib_.R_R, calib_.P_R);
+        }
+
+        // Prep Left camera marker undistorted rectified positions
+        std::vector<cv::Point2d> undMlList;
+        if (!bL.markers.empty()) {
+            std::vector<cv::Point2d> mlPts(bL.markers.size());
+            for (std::size_t k = 0; k < bL.markers.size(); ++k) mlPts[k] = bL.markers[k].position;
+            cv::undistortPoints(mlPts, undMlList, calib_.K_L, calib_.D_L, calib_.R_L, calib_.P_L);
+        }
+
+        // Prep Left camera marker normalized coordinates for ray-sphere fallback
+        std::vector<cv::Point2d> normMlList;
+        if (!bL.markers.empty()) {
+            std::vector<cv::Point2d> mlPts(bL.markers.size());
+            for (std::size_t k = 0; k < bL.markers.size(); ++k) mlPts[k] = bL.markers[k].position;
+            cv::undistortPoints(mlPts, normMlList, calib_.K_L, calib_.D_L);
         }
 
         // Try to match Left markers with Right markers
-        for (const auto& ml : bL.markers) {
-            pt_temp_.create(1, 1, CV_64FC2);
-            pt_temp_.at<cv::Vec2d>(0, 0) = cv::Vec2d(ml.position.x, ml.position.y);
-            cv::undistortPoints(pt_temp_, und_temp_, calib_.K_L, calib_.D_L, calib_.R_L, calib_.P_L);
-            cv::Point2d undMl = getPointDouble(und_temp_);
+        for (std::size_t lIdx = 0; lIdx < bL.markers.size(); ++lIdx) {
+            cv::Point2d undMl = undMlList[lIdx];
 
             int bestMatchIndex = -1;
             double bestMatchDiffY = 3.0; // 3.0 pixels rectified y tolerance
@@ -196,11 +194,7 @@ std::vector<Ball3D> StereoTriangulator::triangulateShot(
                 }
             } else {
                 // Ray-sphere intersection for unmatched left marker
-                pt_temp_.create(1, 1, CV_64FC2);
-                pt_temp_.at<cv::Vec2d>(0, 0) = cv::Vec2d(ml.position.x, ml.position.y);
-                cv::undistortPoints(pt_temp_, und_temp_, calib_.K_L, calib_.D_L);
-                
-                cv::Point2d normL = getPointDouble(und_temp_);
+                cv::Point2d normL = normMlList[lIdx];
                 double x_norm = normL.x;
                 double y_norm = normL.y;
                 
@@ -225,15 +219,17 @@ std::vector<Ball3D> StereoTriangulator::triangulateShot(
         }
 
         // Ray-sphere intersection for unmatched right markers
+        std::vector<cv::Point2d> normMrList;
+        if (!bR.markers.empty()) {
+            std::vector<cv::Point2d> mrPts(bR.markers.size());
+            for (std::size_t k = 0; k < bR.markers.size(); ++k) mrPts[k] = bR.markers[k].position;
+            cv::undistortPoints(mrPts, normMrList, calib_.K_R, calib_.D_R);
+        }
+
         for (std::size_t r = 0; r < bR.markers.size(); ++r) {
             if (rightMarkerUsed[r]) continue;
 
-            const auto& mr = bR.markers[r];
-            pt_temp_.create(1, 1, CV_64FC2);
-            pt_temp_.at<cv::Vec2d>(0, 0) = cv::Vec2d(mr.position.x, mr.position.y);
-            cv::undistortPoints(pt_temp_, und_temp_, calib_.K_R, calib_.D_R);
-
-            cv::Point2d normR = getPointDouble(und_temp_);
+            cv::Point2d normR = normMrList[r];
             double x_norm = normR.x;
             double y_norm = normR.y;
 

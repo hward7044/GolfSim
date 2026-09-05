@@ -5,17 +5,17 @@ project(GolfSim LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(OpenCV REQUIRED)
-
-set(GOLFSIM_OPENCV_LIBS)
-foreach(_mod opencv_core opencv_imgproc opencv_geometry opencv_imgcodecs opencv_calib opencv_calib3d opencv_stereo opencv_highgui opencv_videoio)
-    if(TARGET ${_mod})
-        list(APPEND GOLFSIM_OPENCV_LIBS ${_mod})
-    endif()
-endforeach()
-if(NOT GOLFSIM_OPENCV_LIBS)
-    set(GOLFSIM_OPENCV_LIBS ${OpenCV_LIBS})
-endif()
+find_package(OpenCV 5.0 REQUIRED COMPONENTS
+    core
+    imgproc
+    geometry
+    stereo
+    calib
+    imgcodecs
+    highgui
+    videoio
+)
+set(GOLFSIM_OPENCV_LIBS ${OpenCV_LIBS})
 
 find_package(Eigen3 REQUIRED)
 find_package(spdlog REQUIRED)

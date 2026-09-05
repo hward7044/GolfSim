@@ -1,6 +1,8 @@
 #pragma once
 #include "Math/ISpatialSolver.hpp"
 #include <opencv2/core.hpp>
+#include <opencv2/geometry.hpp>
+#include <opencv2/stereo.hpp>
 
 struct StereoCalibration {
     cv::Mat K_L;
