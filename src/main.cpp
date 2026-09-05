@@ -4,6 +4,9 @@
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <opencv2/opencv.hpp>
+#if __has_include(<opencv2/geometry.hpp>)
+#include <opencv2/geometry.hpp>
+#endif
 #include <spdlog/spdlog.h>
 #include <thread>
 
@@ -18,9 +21,12 @@
 #include "Diagnostics/GlobalLogger.hpp"
 #include "Diagnostics/LogLevel.hpp"
 #include "HAL/IUsbVideoDriver.hpp"
+#ifdef _WIN32
 #include "HAL/MediaFoundationDriver.hpp"
-#include "HAL/V4L2Driver.hpp"
 #include "HAL/Win32Serial.hpp"
+#else
+#include "HAL/V4L2Driver.hpp"
+#endif
 #include "Math/AtomicRingBuffer.hpp"
 #include "Math/BallPresenceTrigger.hpp"
 #include "Math/EigenBallisticsEngine.hpp"
@@ -165,6 +171,9 @@ int main(int argc, char *argv[]) {
     std::cerr << "Log initialization failed: " << ex.what() << std::endl;
   }
 
+  auto cameraSystem = std::make_shared<HardwareSyncedCameraSystem>();
+
+#ifdef _WIN32
   spdlog::info("[System] Initializing camera drivers...");
   MediaFoundationDriver::logConnectedDevices();
 
@@ -182,7 +191,6 @@ int main(int argc, char *argv[]) {
     return 0;
   }
 
-  auto cameraSystem = std::make_shared<HardwareSyncedCameraSystem>();
   uint32_t width = 1280;
   uint32_t height = 800;
 
@@ -205,6 +213,12 @@ int main(int argc, char *argv[]) {
     spdlog::info("[System] Successfully registered Right camera ({}x{})", width,
                  height);
   }
+#else
+  spdlog::info("[System] Initializing camera drivers...");
+  spdlog::warn("[System] Hardware camera drivers (MediaFoundation) are only supported on Windows.");
+  spdlog::warn("[System] Failed to initialize camera hardware (expected in emulation/test environments). Clean exit.");
+  return 0;
+#endif
 
   // Queue buffer manager (capacity of 16 FrameSets)
   auto buffer = std::make_shared<AtomicRingBuffer<FrameSet, 16>>();
@@ -261,6 +275,7 @@ int main(int argc, char *argv[]) {
 // Live Camera Setup and IR Strobe Debug Viewer
 // -------------------------------------------------------------------------
 void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& comPort) {
+#ifdef _WIN32
   std::cout << "\n============================================" << std::endl;
   std::cout << "Starting Live Camera & IR Strobe Debug Viewer" << std::endl;
   std::cout << "============================================" << std::endl;
@@ -486,6 +501,12 @@ void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& co
   cv::destroyAllWindows();
   cameraSystem.shutdown();
   std::cout << "Strobe Debugger shutdown cleanly." << std::endl;
+#else
+  (void)leftCamIdx;
+  (void)rightCamIdx;
+  (void)comPort;
+  std::cerr << "Live Camera & IR Strobe Debug Viewer is only supported on Windows (requires MediaFoundation & Win32Serial)." << std::endl;
+#endif
 }
 
 void runReplayViewer(const std::string &replayDir) {
