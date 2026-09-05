@@ -20,6 +20,7 @@
 #include "HAL/IUsbVideoDriver.hpp"
 #include "HAL/MediaFoundationDriver.hpp"
 #include "HAL/V4L2Driver.hpp"
+#include "HAL/Win32Serial.hpp"
 #include "Math/AtomicRingBuffer.hpp"
 #include "Math/BallPresenceTrigger.hpp"
 #include "Math/EigenBallisticsEngine.hpp"
@@ -43,7 +44,7 @@
 #include <sstream>
 
 const bool RUN_DEBUG_VIEWER = false;
-void runCameraDebugViewer();
+void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& comPort = "COM3");
 
 void runReplayViewer(const std::string &replayDir);
 
@@ -52,6 +53,9 @@ int main(int argc, char *argv[]) {
   int streamFrames = 50;
   int leftCamIdx = 1;
   int rightCamIdx = 0;
+  std::string comPort = "COM3";
+
+  bool liveMode = false;
 
   // Parse command line arguments
   for (int i = 1; i < argc; ++i) {
@@ -60,9 +64,8 @@ int main(int argc, char *argv[]) {
       runReplayViewer(argv[i + 1]);
       return 0;
     }
-    if (arg == "--live" || arg == "-l") {
-      runCameraDebugViewer();
-      return 0;
+    if (arg == "--live" || arg == "-l" || arg == "--strobe" || arg == "--ir-debug") {
+      liveMode = true;
     }
     if (arg == "--stream" || arg == "--record-stream" || arg == "-s") {
       streamMode = true;
@@ -80,6 +83,14 @@ int main(int argc, char *argv[]) {
     if (arg == "--swap-cameras" || arg == "--swap") {
       std::swap(leftCamIdx, rightCamIdx);
     }
+    if (arg == "--com" && i + 1 < argc) {
+      comPort = argv[++i];
+    }
+  }
+
+  if (liveMode) {
+    runCameraDebugViewer(leftCamIdx, rightCamIdx, comPort);
+    return 0;
   }
   // Determine compiler-specific C++ standard version
   long cpp_version = __cplusplus;
@@ -130,7 +141,7 @@ int main(int argc, char *argv[]) {
   std::cout << "Verification completed successfully!" << std::endl;
 
   if (RUN_DEBUG_VIEWER) {
-    runCameraDebugViewer();
+    runCameraDebugViewer(leftCamIdx, rightCamIdx, comPort);
     return 0;
   }
 
@@ -209,8 +220,9 @@ int main(int argc, char *argv[]) {
   // Stereoscopic Ball-Locked Tracker: Fine-tuned floor tee zone ROI (x=350..950, y=440..750)
   cv::Rect searchRoiLeft(350, 440, 600, 310);
   cv::Rect searchRoiRight(350, 440, 600, 310);
-  auto trigger = StereoBallTrackerTrigger(StereoCalibration(), searchRoiLeft,
-                                          searchRoiRight, 15.0, 50.0, 0.45, 120, 65.0, 256, 0.9144, 5, 4, 4.0, 0.04, 150.0);
+  auto trigger = StereoBallTrackerTrigger(
+      StereoCalibration(), searchRoiLeft, searchRoiRight, 15.0, 85.0, 0.25,
+      120, 65.0, 256, 0.9144, 5, 4, 4.0, 0.04, 150.0, 8500.0);
   auto vision = OpenCVMomentsTracker(120, 240, 80.0, 2500.0, 0.5);
   auto spatial = StereoTriangulator();
   auto kinematics = EigenBallisticsEngine();
@@ -245,72 +257,88 @@ int main(int argc, char *argv[]) {
 // -------------------------------------------------------------------------
 // Live Camera Setup and Test Viewer (RUN_DEBUG_VIEWER = true)
 // -------------------------------------------------------------------------
-void runCameraDebugViewer() {
+// -------------------------------------------------------------------------
+// Live Camera Setup and IR Strobe Debug Viewer
+// -------------------------------------------------------------------------
+void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& comPort) {
   std::cout << "\n============================================" << std::endl;
-  std::cout << "Starting Live Camera Hookup and Test" << std::endl;
+  std::cout << "Starting Live Camera & IR Strobe Debug Viewer" << std::endl;
   std::cout << "============================================" << std::endl;
 
-  // 1. Enumerate and log all connected video capture devices on the system
+  Win32Serial serial;
+  if (serial.open(comPort, 115200)) {
+      std::cout << "Successfully connected to Arduino on " << comPort << std::endl;
+  } else {
+      std::cerr << "Warning: Could not open Serial port " << comPort << ". Hardware strobe testing disabled." << std::endl;
+  }
+
+  // 1. Enumerate connected video capture devices
   MediaFoundationDriver::logConnectedDevices();
 
-  // 2. Initialize the MediaFoundationDrivers
-  std::cout << "\nInitializing camera driver 0 (Left)..." << std::endl;
-  auto usbDriverLeft = std::make_unique<MediaFoundationDriver>(0);
+  // 2. Initialize MediaFoundationDrivers with user-specified indices
+  std::cout << "\nInitializing Left camera (Index " << leftCamIdx << ")..." << std::endl;
+  auto usbDriverLeft = std::make_unique<MediaFoundationDriver>(leftCamIdx);
   bool leftOk = usbDriverLeft->initialize();
 
-  std::cout << "Initializing camera driver 1 (Right)..." << std::endl;
-  auto usbDriverRight = std::make_unique<MediaFoundationDriver>(1);
+  std::cout << "Initializing Right camera (Index " << rightCamIdx << ")..." << std::endl;
+  auto usbDriverRight = std::make_unique<MediaFoundationDriver>(rightCamIdx);
   bool rightOk = usbDriverRight->initialize();
 
   if (!leftOk && !rightOk) {
-    std::cerr << "Failed to initialize either camera. Are they connected?"
-              << std::endl;
+    std::cerr << "Failed to initialize cameras. Check USB connection." << std::endl;
     return;
   }
 
-  // 3 & 4. Create and Register the nodes with the camera system
   HardwareSyncedCameraSystem cameraSystem;
   uint32_t width = 1280;
   uint32_t height = 800;
 
+  std::shared_ptr<OV9281CameraNode> nodeL = nullptr;
+  std::shared_ptr<OV9281CameraNode> nodeR = nullptr;
+
   if (leftOk) {
     width = usbDriverLeft->getFrameWidth();
     height = usbDriverLeft->getFrameHeight();
-    auto cameraNodeLeft = std::make_shared<OV9281CameraNode>(
+    nodeL = std::make_shared<OV9281CameraNode>(
         std::move(usbDriverLeft), CameraRole::STEREO_LEFT);
-    cameraSystem.addCameraNode(cameraNodeLeft);
-    std::cout << "Successfully initialized Left camera! Resolution: " << width
-              << "x" << height << std::endl;
-  } else {
-    std::cout << "Left camera was not detected/initialized." << std::endl;
+    cameraSystem.addCameraNode(nodeL);
+    nodeL->enableHardwareStrobeMode();
+    std::cout << "Successfully initialized Left camera (" << width << "x" << height << ") [Strobe Enabled]" << std::endl;
   }
 
   if (rightOk) {
     width = usbDriverRight->getFrameWidth();
     height = usbDriverRight->getFrameHeight();
-    auto cameraNodeRight = std::make_shared<OV9281CameraNode>(
+    nodeR = std::make_shared<OV9281CameraNode>(
         std::move(usbDriverRight), CameraRole::STEREO_RIGHT);
-    cameraSystem.addCameraNode(cameraNodeRight);
-    std::cout << "Successfully initialized Right camera! Resolution: " << width
-              << "x" << height << std::endl;
-  } else {
-    std::cout << "Right camera was not detected/initialized." << std::endl;
+    cameraSystem.addCameraNode(nodeR);
+    nodeR->enableHardwareStrobeMode();
+    std::cout << "Successfully initialized Right camera (" << width << "x" << height << ") [Strobe Enabled]" << std::endl;
   }
 
-  // 5. Pre-allocate the FrameSet buffer
   FrameSet frameSet;
   frameSet.preallocate(width, height);
 
-  enum ViewMode { VIEW_BOTH, VIEW_LEFT_ONLY, VIEW_RIGHT_ONLY };
+  enum ViewMode { VIEW_BOTH, VIEW_LEFT_ONLY, VIEW_RIGHT_ONLY, VIEW_GLINT_HIGHLIGHT, VIEW_THRESHOLD_MASK };
   int currentMode = VIEW_BOTH;
+  int activeThreshold = 200;
+  bool strobeOn = true;
+  int expPresetIdx = 2; // Default 2ms
+  const int expPresetsUs[] = { 500, 1000, 2000, 5000, 10000 };
+  const int numExpPresets = 5;
 
-  std::cout << "\nStarting live video display. Controls:" << std::endl;
-  std::cout << "  - Press TAB or 'v' inside the video window to cycle views "
-               "(Both -> Left -> Right)"
-            << std::endl;
-  std::cout << "  - Press ESC to quit" << std::endl;
+  std::cout << "\n=======================================================" << std::endl;
+  std::cout << "GOLFSIM IR STROBE DEBUGGER CONTROLS:" << std::endl;
+  std::cout << "  - Press '1' : Turn IR Illumination CONTINUOUSLY ON ('1')" << std::endl;
+  std::cout << "  - Press '0' : Turn IR Illumination OFF ('0')" << std::endl;
+  std::cout << "  - Press 's' or 'f' : Fire 300ms IR Strobe Burst ('F')" << std::endl;
+  std::cout << "  - Press 'e' : Cycle Exposure (500us -> 1ms -> 2ms -> 5ms -> 10ms)" << std::endl;
+  std::cout << "  - Press 'v' : Cycle View Modes (Both -> Left -> Right -> Glints -> Threshold Mask)" << std::endl;
+  std::cout << "  - Press '+' / '-' : Adjust Glint Threshold (Current: " << activeThreshold << ")" << std::endl;
+  std::cout << "  - Press ESC / 'q' : Exit Debugger" << std::endl;
+  std::cout << "=======================================================\n" << std::endl;
 
-  std::string windowName = "Stereo Cameras Live Feed";
+  std::string windowName = "GolfSim IR Strobe Debugger";
   cv::namedWindow(windowName, cv::WINDOW_AUTOSIZE);
 
   auto start_time = std::chrono::steady_clock::now();
@@ -319,14 +347,12 @@ void runCameraDebugViewer() {
 
   while (true) {
     if (!cameraSystem.captureSynchronizedFrames(frameSet)) {
-      std::cerr << "Failed to capture frames!" << std::endl;
-      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
       continue;
     }
 
     frame_count++;
 
-    // Measure FPS
     auto current_time = std::chrono::steady_clock::now();
     std::chrono::duration<double> elapsed = current_time - start_time;
     if (elapsed.count() >= 1.0) {
@@ -335,114 +361,131 @@ void runCameraDebugViewer() {
       start_time = current_time;
     }
 
-    // Get the frames
     cv::Mat leftFrame = frameSet.getFrame(CameraRole::STEREO_LEFT);
     cv::Mat rightFrame = frameSet.getFrame(CameraRole::STEREO_RIGHT);
 
-    cv::Scalar meanLeft =
-        leftFrame.empty() ? cv::Scalar(0) : cv::mean(leftFrame);
-    cv::Scalar meanRight =
-        rightFrame.empty() ? cv::Scalar(0) : cv::mean(rightFrame);
+    cv::Scalar meanLeft = leftFrame.empty() ? cv::Scalar(0) : cv::mean(leftFrame);
+    cv::Scalar meanRight = rightFrame.empty() ? cv::Scalar(0) : cv::mean(rightFrame);
 
-    // Print stats periodically to console
-    if (frame_count % 30 == 0) {
-      std::cout << "Frame Stats: L="
-                << (leftFrame.empty() ? "N/A"
-                                      : std::to_string(leftFrame.cols) + "x" +
-                                            std::to_string(leftFrame.rows))
-                << " (Avg=" << std::fixed << std::setprecision(1) << meanLeft[0]
-                << ")"
-                << " | R="
-                << (rightFrame.empty() ? "N/A"
-                                       : std::to_string(rightFrame.cols) + "x" +
-                                             std::to_string(rightFrame.rows))
-                << " (Avg=" << meanRight[0] << ")"
-                << " | ViewMode="
-                << (currentMode == VIEW_BOTH
-                        ? "BOTH"
-                        : (currentMode == VIEW_LEFT_ONLY ? "LEFT" : "RIGHT"))
-                << " | FPS=" << std::setprecision(2) << fps << "\r"
-                << std::flush;
-    }
-
-    // Draw overlays
-    std::string fpsText = "FPS: " + std::to_string(fps).substr(0, 5);
     cv::Mat displayLeft, displayRight;
+
+    std::string strobeStatusStr = strobeOn ? "STROBE: ON [Pin active]" : "STROBE: OFF";
+    std::string expStr = "Exp: " + std::to_string(expPresetsUs[expPresetIdx]) + "us";
 
     if (!leftFrame.empty()) {
       cv::cvtColor(leftFrame, displayLeft, cv::COLOR_GRAY2BGR);
-      std::string intTextL =
-          "Intensity: " + std::to_string(meanLeft[0]).substr(0, 4);
-      cv::putText(displayLeft, "LEFT " + fpsText, cv::Point(20, 40),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
-      cv::putText(displayLeft, intTextL, cv::Point(20, 80),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
+      if (currentMode == VIEW_GLINT_HIGHLIGHT || currentMode == VIEW_THRESHOLD_MASK) {
+        cv::Mat mask;
+        cv::threshold(leftFrame, mask, activeThreshold, 255, cv::THRESH_BINARY);
+        if (currentMode == VIEW_THRESHOLD_MASK) {
+          cv::cvtColor(mask, displayLeft, cv::COLOR_GRAY2BGR);
+        } else {
+          // Highlight glints in bright red
+          std::vector<std::vector<cv::Point>> contours;
+          cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+          for (const auto& c : contours) {
+            cv::Rect r = cv::boundingRect(c);
+            cv::rectangle(displayLeft, r, cv::Scalar(0, 0, 255), 2);
+            cv::circle(displayLeft, cv::Point(r.x + r.width/2, r.y + r.height/2), r.width/2 + 4, cv::Scalar(0, 255, 255), 2);
+          }
+        }
+      }
+      cv::putText(displayLeft, "LEFT | " + strobeStatusStr, cv::Point(20, 35),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.65, strobeOn ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255), 2);
+      cv::putText(displayLeft, expStr + " | Thresh: " + std::to_string(activeThreshold), cv::Point(20, 65),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(255, 255, 0), 2);
     }
 
     if (!rightFrame.empty()) {
       cv::cvtColor(rightFrame, displayRight, cv::COLOR_GRAY2BGR);
-      std::string intTextR =
-          "Intensity: " + std::to_string(meanRight[0]).substr(0, 4);
-      cv::putText(displayRight, "RIGHT " + fpsText, cv::Point(20, 40),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
-      cv::putText(displayRight, intTextR, cv::Point(20, 80),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
+      if (currentMode == VIEW_GLINT_HIGHLIGHT || currentMode == VIEW_THRESHOLD_MASK) {
+        cv::Mat mask;
+        cv::threshold(rightFrame, mask, activeThreshold, 255, cv::THRESH_BINARY);
+        if (currentMode == VIEW_THRESHOLD_MASK) {
+          cv::cvtColor(mask, displayRight, cv::COLOR_GRAY2BGR);
+        } else {
+          // Highlight glints in bright red
+          std::vector<std::vector<cv::Point>> contours;
+          cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+          for (const auto& c : contours) {
+            cv::Rect r = cv::boundingRect(c);
+            cv::rectangle(displayRight, r, cv::Scalar(0, 0, 255), 2);
+            cv::circle(displayRight, cv::Point(r.x + r.width/2, r.y + r.height/2), r.width/2 + 4, cv::Scalar(0, 255, 255), 2);
+          }
+        }
+      }
+      cv::putText(displayRight, "RIGHT | FPS: " + std::to_string(fps).substr(0, 4), cv::Point(20, 35),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 255, 0), 2);
+      cv::putText(displayRight, "Mean: " + std::to_string(meanRight[0]).substr(0, 4), cv::Point(20, 65),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(255, 255, 0), 2);
     }
 
-    // Build composite image based on active view mode
     cv::Mat frameToDraw;
-    if (currentMode == VIEW_BOTH) {
+    if (currentMode == VIEW_BOTH || currentMode == VIEW_GLINT_HIGHLIGHT || currentMode == VIEW_THRESHOLD_MASK) {
       if (!displayLeft.empty() && !displayRight.empty()) {
-        cv::Mat resizedLeft, resizedRight;
-        cv::resize(displayLeft, resizedLeft, cv::Size(640, 400));
-        cv::resize(displayRight, resizedRight, cv::Size(640, 400));
-        cv::hconcat(resizedLeft, resizedRight, frameToDraw);
+        cv::Mat resizedL, resizedR;
+        cv::resize(displayLeft, resizedL, cv::Size(640, 400));
+        cv::resize(displayRight, resizedR, cv::Size(640, 400));
+        cv::hconcat(resizedL, resizedR, frameToDraw);
       } else if (!displayLeft.empty()) {
         frameToDraw = displayLeft;
       } else if (!displayRight.empty()) {
         frameToDraw = displayRight;
       }
     } else if (currentMode == VIEW_LEFT_ONLY) {
-      if (!displayLeft.empty()) {
-        frameToDraw = displayLeft;
-      } else {
-        frameToDraw = cv::Mat::zeros(400, 640, CV_8UC3);
-        cv::putText(frameToDraw, "LEFT CAMERA OFFLINE", cv::Point(120, 200),
-                    cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
-      }
+      frameToDraw = displayLeft;
     } else if (currentMode == VIEW_RIGHT_ONLY) {
-      if (!displayRight.empty()) {
-        frameToDraw = displayRight;
-      } else {
-        frameToDraw = cv::Mat::zeros(400, 640, CV_8UC3);
-        cv::putText(frameToDraw, "RIGHT CAMERA OFFLINE", cv::Point(120, 200),
-                    cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
-      }
+      frameToDraw = displayRight;
     }
 
     if (!frameToDraw.empty()) {
       cv::imshow(windowName, frameToDraw);
     }
 
-    // Break on ESC key, toggle views on TAB (9) or v/V (118/86)
     int key = cv::waitKey(1);
-    if (key == 27) {
+    if (key == 27 || key == 'q' || key == 'Q') {
       break;
-    } else if (key == 9 || key == 118 || key == 86) {
-      currentMode = (currentMode + 1) % 3;
-      std::cout << "\nSwitched View Mode to: "
-                << (currentMode == VIEW_BOTH
-                        ? "BOTH (50/50)"
-                        : (currentMode == VIEW_LEFT_ONLY ? "LEFT ONLY"
-                                                         : "RIGHT ONLY"))
-                << std::endl;
+    } else if (key == '1') {
+      std::cout << "[IR Strobe Debugger] Turning IR Illumination CONTINUOUSLY ON ('1')..." << std::endl;
+      if (serial.isOpen()) {
+          serial.writeString("1");
+      } else {
+          std::cout << "[IR Strobe Debugger] Serial not connected." << std::endl;
+      }
+    } else if (key == '0') {
+      std::cout << "[IR Strobe Debugger] Turning IR Illumination OFF ('0')..." << std::endl;
+      if (serial.isOpen()) {
+          serial.writeString("0");
+      } else {
+          std::cout << "[IR Strobe Debugger] Serial not connected." << std::endl;
+      }
+    } else if (key == 'e' || key == 'E') {
+      expPresetIdx = (expPresetIdx + 1) % numExpPresets;
+      int us = expPresetsUs[expPresetIdx];
+      std::cout << "[IR Strobe Debugger] Setting exposure to " << us << " us..." << std::endl;
+      if (nodeL) nodeL->setExposure(us);
+      if (nodeR) nodeR->setExposure(us);
+    } else if (key == 9 || key == 'v' || key == 'V') {
+      currentMode = (currentMode + 1) % 5;
+    } else if (key == 's' || key == 'S' || key == 'f' || key == 'F') {
+      std::cout << "[IR Strobe Debugger] Sending 300ms IR Strobe Burst ('F')..." << std::endl;
+      if (serial.isOpen()) {
+          serial.writeString("F");
+      } else {
+          std::cout << "[IR Strobe Debugger] Serial not connected." << std::endl;
+      }
+    } else if (key == '+' || key == '=') {
+      activeThreshold = (std::min)(254, activeThreshold + 5);
+      std::cout << "[IR Strobe Debugger] Threshold set to: " << activeThreshold << std::endl;
+    } else if (key == '-' || key == '_') {
+      activeThreshold = (std::max)(10, activeThreshold - 5);
+      std::cout << "[IR Strobe Debugger] Threshold set to: " << activeThreshold << std::endl;
     }
   }
 
-  std::cout << "\nStopping acquisition..." << std::endl;
   cv::destroyAllWindows();
   cameraSystem.shutdown();
-  std::cout << "Shutdown completed cleanly." << std::endl;
+  std::cout << "Strobe Debugger shutdown cleanly." << std::endl;
 }
 
 void runReplayViewer(const std::string &replayDir) {

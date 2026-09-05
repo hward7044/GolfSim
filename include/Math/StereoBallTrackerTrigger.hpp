@@ -32,6 +32,7 @@ private:
   double minBallRadiusPx_;
   double maxBallRadiusPx_;
   double minBallArea_;
+  double maxBallArea_;
   double minCircularity_;
   int ballThreshold_;
   double epipolarTolerancePx_;
@@ -100,15 +101,16 @@ private:
   int searchingLogCounter_;
 
 public:
-  StereoBallTrackerTrigger(
-      StereoCalibration calib = StereoCalibration(),
-      cv::Rect searchRoiLeft = cv::Rect(350, 440, 600, 310),
-      cv::Rect searchRoiRight = cv::Rect(350, 440, 600, 310),
-      double minRadius = 15.0, double maxRadius = 50.0, double minCirc = 0.45,
-      int thresh = 120, double epipolarTol = 65.0, int armedWinSize = 256,
-      double max3DDist = 0.9144, int searchLockFrames = 5, int graceMax = 4,
-      double impactVelThresh = 4.0, double motionDispThresh = 0.04,
-      double minArea = 150.0);
+  StereoBallTrackerTrigger(StereoCalibration calib = StereoCalibration(),
+                           cv::Rect searchRoiLeft = cv::Rect(350, 440, 600, 310),
+                           cv::Rect searchRoiRight = cv::Rect(350, 440, 600, 310),
+                           double minRadius = 15.0, double maxRadius = 85.0,
+                           double minCirc = 0.25, int thresh = 120,
+                           double epipolarTol = 65.0, int armedWinSize = 256,
+                           double max3DDist = 0.9144, int searchLockFrames = 5,
+                           int graceMax = 4, double impactVelThresh = 4.0,
+                           double motionDispThresh = 0.04, double minArea = 150.0,
+                           double maxArea = 8500.0);
 
   bool checkTrigger(const cv::Mat &leftFrame,
                     const cv::Mat &rightFrame) override;

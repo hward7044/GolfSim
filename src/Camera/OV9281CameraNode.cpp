@@ -13,10 +13,20 @@ CameraRole OV9281CameraNode::getRole() {
     return role_;
 }
 
+#include "HAL/MediaFoundationDriver.hpp"
+
 void OV9281CameraNode::enableHardwareStrobeMode() {
+    setStrobe(true);
+}
+
+void OV9281CameraNode::setStrobe(bool enable) {
+    // Disabled: Hardware strobe configuration via UVC is unsupported on this bridge.
+    // The Arduino MCU acts as the trigger master via Serial commands instead.
+}
+
+void OV9281CameraNode::setExposure(int microseconds) {
     if (usbDriver) {
-        // Stream on / toggle hardware strobe trigger register
-        usbDriver->injectImmediateRegisterWrite(OV9281Reg::STREAM_ON, 0x01);
+        usbDriver->setHardwareExposure(microseconds);
     }
 }
 

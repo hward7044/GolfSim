@@ -76,11 +76,10 @@ bool MediaFoundationDriver::initialize() {
     } else {
         // Pre-build the KSP_NODE template so injectImmediateRegisterWrite()
         // has zero setup overhead on the hot path
-        ZeroMemory(&cachedKspNode_, sizeof(cachedKspNode_));
-        cachedKspNode_.Property.Set   = ARDUCAM_XU_GUID;
-        cachedKspNode_.Property.Id    = ARDUCAM_XU_CONTROL_ID;
-        cachedKspNode_.Property.Flags = KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_TOPOLOGY;
-        cachedKspNode_.NodeId         = xuNodeId_;
+        ZeroMemory(&cachedKspProp_, sizeof(cachedKspProp_));
+        cachedKspProp_.Set   = ARDUCAM_XU_GUID;
+        cachedKspProp_.Id    = ARDUCAM_XU_CONTROL_ID;
+        cachedKspProp_.Flags = KSPROPERTY_TYPE_SET;
     }
 
     initialized_ = true;
@@ -393,47 +392,71 @@ bool MediaFoundationDriver::discoverExtensionUnit() {
 
     ComPtr<IKsTopologyInfo> ksTopology;
     HRESULT hr = mediaSource_->QueryInterface(IID_PPV_ARGS(&ksTopology));
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        spdlog::warn("[MediaFoundationDriver] Failed to QueryInterface for IKsTopologyInfo. HR=0x{:08X}",
+                     static_cast<unsigned long>(hr));
+        return false;
+    }
 
     DWORD numNodes = 0;
     hr = ksTopology->get_NumNodes(&numNodes);
-    if (FAILED(hr) || numNodes == 0) return false;
+    if (FAILED(hr) || numNodes == 0) {
+        spdlog::warn("[MediaFoundationDriver] IKsTopologyInfo get_NumNodes returned 0 or error. HR=0x{:08X}",
+                     static_cast<unsigned long>(hr));
+        return false;
+    }
+
+    spdlog::info("[MediaFoundationDriver] Inspecting {} UVC Topology Nodes for Extension Units...", numNodes);
 
     for (DWORD i = 0; i < numNodes; ++i) {
         GUID nodeType = GUID_NULL;
         hr = ksTopology->get_NodeType(i, &nodeType);
         if (FAILED(hr)) continue;
 
+        spdlog::info("[MediaFoundationDriver] Node #{}: Type={:08X}-{:04X}-{:04X}",
+                     i, nodeType.Data1, nodeType.Data2, nodeType.Data3);
+
         if (nodeType == KSNODETYPE_DEV_SPECIFIC) {
             ComPtr<IKsControl> tempKsControl;
             hr = ksTopology->CreateNodeInstance(i, IID_PPV_ARGS(&tempKsControl));
-            if (SUCCEEDED(hr)) {
-                // Test if this Extension Unit responds to our XU GUID
-                KSP_NODE kspNode;
-                ZeroMemory(&kspNode, sizeof(kspNode));
-                kspNode.Property.Set = ARDUCAM_XU_GUID;
-                kspNode.Property.Id = ARDUCAM_XU_CONTROL_ID;
-                kspNode.Property.Flags = KSPROPERTY_TYPE_BASICSUPPORT | KSPROPERTY_TYPE_TOPOLOGY;
-                kspNode.NodeId = i;
+            if (SUCCEEDED(hr) && tempKsControl) {
+                spdlog::info("[MediaFoundationDriver] Successfully created IKsControl instance for Node #{}!", i);
+                xuNodeId_ = i;
+                ksControl_ = tempKsControl;
+                
+                // Set up KSPROPERTY structure template for node instance IKsControl
+                ZeroMemory(&cachedKspProp_, sizeof(cachedKspProp_));
+                cachedKspProp_.Set   = ARDUCAM_XU_GUID;
+                cachedKspProp_.Id    = 1;
+                cachedKspProp_.Flags = KSPROPERTY_TYPE_SET;
 
-                KSPROPERTY_DESCRIPTION desc;
+                // Query the actual Extension Unit GUID to log it
+                static const GUID MY_PROPSETID_VIDCAP_EXTENSION_UNIT = { 0x1C31960E, 0x7C1C, 0x4E2A, { 0x8B, 0xA6, 0x25, 0x8F, 0x2D, 0xD3, 0x4E, 0xEB } };
+                KSPROPERTY prop;
+                prop.Set = MY_PROPSETID_VIDCAP_EXTENSION_UNIT;
+                prop.Id = KSPROPERTY_EXTENSION_UNIT_INFO;
+                prop.Flags = KSPROPERTY_TYPE_GET;
+                
+                GUID actualGuid = {0};
                 ULONG bytesReturned = 0;
-                hr = tempKsControl->KsProperty(
-                    reinterpret_cast<PKSPROPERTY>(&kspNode),
-                    sizeof(kspNode),
-                    &desc,
-                    sizeof(desc),
-                    &bytesReturned
-                );
-
-                if (SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_MORE_DATA)) {
-                    xuNodeId_ = i;
-                    ksControl_ = tempKsControl;
-                    return true;
+                HRESULT guidHr = ksControl_->KsProperty(&prop, sizeof(prop), &actualGuid, sizeof(actualGuid), &bytesReturned);
+                if (SUCCEEDED(guidHr)) {
+                    spdlog::info("[MediaFoundationDriver] ACTUAL Extension Unit GUID for Node #{}: {{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+                        i, actualGuid.Data1, actualGuid.Data2, actualGuid.Data3,
+                        actualGuid.Data4[0], actualGuid.Data4[1], actualGuid.Data4[2], actualGuid.Data4[3],
+                        actualGuid.Data4[4], actualGuid.Data4[5], actualGuid.Data4[6], actualGuid.Data4[7]);
+                } else {
+                    spdlog::warn("[MediaFoundationDriver] Failed to get ACTUAL Extension Unit GUID. HR=0x{:08X}", static_cast<unsigned long>(guidHr));
                 }
+
+                return true;
+            } else {
+                spdlog::warn("[MediaFoundationDriver] CreateNodeInstance failed for Node #{}. HR=0x{:08X}",
+                             i, static_cast<unsigned long>(hr));
             }
         }
     }
+    spdlog::warn("[MediaFoundationDriver] No KSNODETYPE_DEV_SPECIFIC extension unit found among {} nodes.", numNodes);
     return false;
 }
 
@@ -558,71 +581,15 @@ void MediaFoundationDriver::setHardwareExposure(int microseconds) {
 //   - No logging on the success path (cerr only on failure)
 
 void MediaFoundationDriver::injectImmediateRegisterWrite(uint16_t reg, uint8_t value) {
-    if (!ksControl_) return;  // Silent fail — fast path, no logging
-
-    // =========================================================================
-    // TODO: VALIDATE AND ADJUST PACKET LAYOUT ONCE HARDWARE DOCUMENTATION IS AVAILABLE.
-    //
-    // Currently, this implementation assumes a standard 3-byte payload format
-    // for direct I2C register writes:
-    //   Byte 0: Register Address High Byte
-    //   Byte 1: Register Address Low Byte
-    //   Byte 2: Register Value
-    //
-    // Depending on the Arducam firmware version or specific model, the USB control
-    // payload might require a different structure (e.g., prefixing with a command ID,
-    // using a specific packet structure, or matching a specific size like 4 or 8 bytes).
-    //
-    // Once the exact UVC Extension Unit (XU) descriptor specifications are obtained:
-    // 1. Update the byte order or pack layout in `dataBuffer`.
-    // 2. Adjust the packet size passed to `KsProperty`.
-    // 3. Verify ARDUCAM_XU_GUID and ARDUCAM_XU_CONTROL_ID match device descriptor.
-    // =========================================================================
-
-    // Pack the I2C register write command — stack-allocated, zero overhead
-    BYTE dataBuffer[3];
-    dataBuffer[0] = static_cast<BYTE>((reg >> 8) & 0xFF);  // Register Address High
-    dataBuffer[1] = static_cast<BYTE>(reg & 0xFF);         // Register Address Low
-    dataBuffer[2] = value;                                  // Register Value
-
-    ULONG bytesReturned = 0;
-    HRESULT hr = ksControl_->KsProperty(
-        reinterpret_cast<PKSPROPERTY>(&cachedKspNode_),
-        sizeof(cachedKspNode_),
-        dataBuffer,
-        sizeof(dataBuffer),
-        &bytesReturned
-    );
-
-    if (FAILED(hr)) {
-        // Only log on failure — success path is completely silent for speed
-        spdlog::error("[MediaFoundationDriver] KsProperty register write failed. reg=0x{:04X} val=0x{:02X} HR=0x{:08X}",
-                      reg, value, static_cast<unsigned long>(hr));
-    }
+    // Disabled: The standard UVC firmware on this Arducam OV9281 bridge does not 
+    // expose a UVC Extension Unit for I2C pass-through. KsProperty requests will 
+    // fail with 0x80070492 (ERROR_PROP_NOT_FOUND).
 }
 
 void MediaFoundationDriver::configureTriggerAndExposureSettings() {
-    if (!ksControl_) {
-        spdlog::warn("[MediaFoundationDriver] Extension unit unavailable. Skipping startup register configuration.");
-        return;
-    }
-
-    spdlog::info("[MediaFoundationDriver] Configuring OV9281 registers for external trigger mode & 10ms exposure.");
-
-    // Setup external trigger mode:
-    // Typical OV9281 configuration: 
-    // - 0x3006: FSIN pin input enable (value 0x02)
-    // - 0x3812: Set external trigger mode (value 0x30)
-    injectImmediateRegisterWrite(0x3006, 0x02);
-    injectImmediateRegisterWrite(0x3812, 0x30);
-
-    // Set exposure to 10ms (approx 840 line periods at ~11.9us row time)
-    // 840 = 0x0348 -> EXPOSURE_HI (0x3500) = 0x00, EXPOSURE_MID (0x3501) = 0x03, EXPOSURE_LO (0x3502) = 0x48
-    injectImmediateRegisterWrite(OV9281Reg::EXPOSURE_HI, 0x00);
-    injectImmediateRegisterWrite(OV9281Reg::EXPOSURE_MID, 0x03);
-    injectImmediateRegisterWrite(OV9281Reg::EXPOSURE_LO, 0x48);
-
-    spdlog::info("[MediaFoundationDriver] Startup registers written successfully.");
+    // Disabled: Standard UVC driver handles exposure. We cannot write I2C registers 
+    // via UVC on this hardware, so we rely on the default firmware state.
+    spdlog::info("[MediaFoundationDriver] Hardware register configuration skipped (Unsupported on this UVC bridge).");
 }
 
 #endif

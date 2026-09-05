@@ -10,13 +10,13 @@ StereoBallTrackerTrigger::StereoBallTrackerTrigger(
     double minRadius, double maxRadius, double minCirc, int thresh,
     double epipolarTol, int armedWinSize, double max3DDist,
     int searchLockFrames, int graceMax, double impactVelThresh,
-    double motionDispThresh, double minArea)
+    double motionDispThresh, double minArea, double maxArea)
     : calib_(calib), state_(StereoTriggerState::SEARCHING),
       searchRoiLeft_(searchRoiLeft), searchRoiRight_(searchRoiRight),
       minBallRadiusPx_(minRadius), maxBallRadiusPx_(maxRadius),
-      minBallArea_(minArea), minCircularity_(minCirc), ballThreshold_(thresh),
-      epipolarTolerancePx_(epipolarTol), disparityMinPx_(10.0),
-      disparityMaxPx_(400.0), armedWindowSize_(armedWinSize),
+      minBallArea_(minArea), maxBallArea_(maxArea), minCircularity_(minCirc),
+      ballThreshold_(thresh), epipolarTolerancePx_(epipolarTol),
+      disparityMinPx_(10.0), disparityMaxPx_(400.0), armedWindowSize_(armedWinSize),
       max3DDistanceMeters_(max3DDist), minZDistanceMeters_(0.20),
       searchLockFrameCount_(searchLockFrames), searchStabilityCounter_(0),
       lastSearchCandidate3D_(0.0, 0.0, 0.0),
@@ -147,7 +147,7 @@ std::vector<BlobCandidate> StereoBallTrackerTrigger::extractCandidates(
 
   for (const auto &contour : contours) {
     double area = cv::contourArea(contour);
-    if (area < minBallArea_)
+    if (area < minBallArea_ || area > maxBallArea_)
       continue;
 
     cv::Point2f center;

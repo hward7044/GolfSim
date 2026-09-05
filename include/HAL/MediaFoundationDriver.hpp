@@ -31,8 +31,8 @@ private:
     ComPtr<IKsControl>       ksControl_;
     DWORD                    xuNodeId_ = 0;
 
-    // --- Cached for hot-path performance: pre-built KSP_NODE template ---
-    KSP_NODE                 cachedKspNode_{};
+    // --- Cached for hot-path performance: pre-built KSPROPERTY template ---
+    KSPROPERTY               cachedKspProp_{};
 
     // --- Frame geometry (resolved at init) ---
     uint32_t frameWidth_  = 0;

@@ -21,6 +21,7 @@ const int FLASH_DURATION_US = 100; // Duration of each IR flash (100 microsecond
 const int FLASH_GAP_US = 900;      // Delay between flashes (900 microseconds = 1ms interval)
 
 void setup() {
+    Serial.begin(115200); // Initialize Serial for manual PC triggers
     pinMode(STROBE_INPUT_PIN, INPUT);
     pinMode(IR_OUTPUT_PIN, OUTPUT);
     digitalWrite(IR_OUTPUT_PIN, LOW); // Start with emitter off
@@ -29,13 +30,40 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(STROBE_INPUT_PIN), fireStrobeSequence, RISING);
 }
 
+bool continuousMode = false;
+
 void loop() {
-    // Keep loop empty. All microsecond strobe timing is handled by hardware interrupts.
+    // Check if the PC sent a command via Serial
+    if (Serial.available() > 0) {
+        char cmd = Serial.read();
+        if (cmd == 'F' || cmd == 'f') {
+            // Sustained burst (300ms) for visual live-stream debugging
+            for (int i = 0; i < 150; ++i) {
+                digitalWrite(IR_OUTPUT_PIN, HIGH);
+                delayMicroseconds(FLASH_DURATION_US);
+                digitalWrite(IR_OUTPUT_PIN, LOW);
+                delayMicroseconds(FLASH_GAP_US);
+            }
+            if (!continuousMode) {
+                digitalWrite(IR_OUTPUT_PIN, LOW);
+            } else {
+                digitalWrite(IR_OUTPUT_PIN, HIGH);
+            }
+        } else if (cmd == '1') {
+            continuousMode = true;
+            digitalWrite(IR_OUTPUT_PIN, HIGH);
+        } else if (cmd == '0') {
+            continuousMode = false;
+            digitalWrite(IR_OUTPUT_PIN, LOW);
+        }
+    }
 }
 
 // Interrupt Service Routine (ISR)
-// Fires 3 quick strobe pulses spaced 1ms apart (from start of flash to start of flash)
+// Microsecond single-frame pulse sequence (for hardware trigger)
 void fireStrobeSequence() {
+    if (continuousMode) return; // Ignore if continuously ON
+
     // Pulse 1
     digitalWrite(IR_OUTPUT_PIN, HIGH);
     delayMicroseconds(FLASH_DURATION_US);
