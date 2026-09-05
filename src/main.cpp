@@ -222,6 +222,7 @@ int main(int argc, char *argv[]) {
 
   // Queue buffer manager (capacity of 16 FrameSets)
   auto buffer = std::make_shared<AtomicRingBuffer<FrameSet, 16>>();
+  buffer->preallocate(1280, 800);
 
   // Pipeline components initialization:
   // - Left camera optical gate trigger (Region of Interest, min Ball pixels,

@@ -71,16 +71,18 @@ void ThreadManager::startConsumerThread() {
     consumerThread_ = std::jthread([this](std::stop_token stopToken) {
         spdlog::info("[ThreadManager] Starting Consumer Thread...");
 
+        FrameSet consumerFrameSet;
+        consumerFrameSet.preallocate(1280, 800);
+
         while (!stopToken.stop_requested() && running_) {
             if (!buffer || !stateMachine) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
 
-            auto frameSetOpt = buffer->pop();
-            if (frameSetOpt) {
+            if (buffer->pop(consumerFrameSet)) {
                 // Process the frames in the mathematical/vision pipeline
-                stateMachine->processNextFrame(*frameSetOpt);
+                stateMachine->processNextFrame(consumerFrameSet);
             } else {
                 // No frames available in the atomic ring buffer; yield execution
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));

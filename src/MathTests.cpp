@@ -4,6 +4,8 @@
 #include "Math/OpenCVMomentsTracker.hpp"
 #include "Math/StereoTriangulator.hpp"
 #include "Math/EigenBallisticsEngine.hpp"
+#include "Math/AtomicRingBuffer.hpp"
+#include "Camera/FrameSet.hpp"
 #include "Diagnostics/FlightRecorder.hpp"
 #include <Eigen/Geometry>
 #include <spdlog/spdlog.h>
@@ -469,6 +471,153 @@ void testStereoBallTrackerTrigger() {
     spdlog::info("[TEST] StereoBallTrackerTrigger verification passed.");
 }
 
+void testAtomicRingBufferOverwrite() {
+    AtomicRingBuffer<FrameSet, 16> ringBuffer;
+    ringBuffer.preallocate(100, 100);
+
+    assert(ringBuffer.empty());
+    assert(ringBuffer.size() == 0);
+    assert(ringBuffer.capacity() == 15);
+
+    // 1. Test basic push and pop
+    FrameSet pushFrame;
+    pushFrame.preallocate(100, 100);
+    pushFrame.timestamp = 1001;
+
+    ringBuffer.push(pushFrame);
+    assert(!ringBuffer.empty());
+    assert(ringBuffer.size() == 1);
+
+    FrameSet popFrame;
+    popFrame.preallocate(100, 100);
+    bool popSuccess = ringBuffer.pop(popFrame);
+    assert(popSuccess);
+    assert(popFrame.timestamp == 1001);
+    assert(popFrame.getFrame(CameraRole::STEREO_LEFT).rows == 100);
+    assert(popFrame.getFrame(CameraRole::STEREO_LEFT).cols == 100);
+    assert(ringBuffer.empty());
+
+    // 2. Test overwrite semantics (pushing 30 items into capacity 15 buffer)
+    for (uint64_t i = 0; i < 30; ++i) {
+        FrameSet f;
+        f.preallocate(100, 100);
+        f.timestamp = i;
+        ringBuffer.push(f);
+    }
+
+    // Since capacity is 15, size should be <= 15
+    assert(ringBuffer.size() <= 15);
+
+    // Drain and verify monotonic increasing timestamps and no corrupted frames
+    uint64_t lastTimestamp = 0;
+    size_t drainedCount = 0;
+    FrameSet drainedFrame;
+    drainedFrame.preallocate(100, 100);
+    while (ringBuffer.pop(drainedFrame)) {
+        assert(drainedFrame.getFrame(CameraRole::STEREO_LEFT).rows == 100);
+        assert(drainedFrame.getFrame(CameraRole::STEREO_RIGHT).cols == 100);
+        if (drainedCount > 0) {
+            assert(drainedFrame.timestamp > lastTimestamp);
+        }
+        lastTimestamp = drainedFrame.timestamp;
+        drainedCount++;
+    }
+    assert(drainedCount <= 15);
+    assert(drainedCount > 0);
+    assert(lastTimestamp == 29);
+
+    // 3. High-Concurrency Stress Test: 20,000 frames pushed by fast producer
+    std::atomic<bool> producerDone{false};
+    std::atomic<size_t> framesPopped{0};
+    const size_t TOTAL_PRODUCE = 20000;
+
+    std::thread producer([&]() {
+        FrameSet prodFrame;
+        prodFrame.preallocate(100, 100);
+        for (size_t i = 1; i <= TOTAL_PRODUCE; ++i) {
+            prodFrame.timestamp = i;
+            ringBuffer.push(prodFrame);
+        }
+        producerDone = true;
+    });
+
+    std::thread consumer([&]() {
+        FrameSet consFrame;
+        consFrame.preallocate(100, 100);
+        uint64_t prevTs = 0;
+        while (!producerDone || !ringBuffer.empty()) {
+            if (ringBuffer.pop(consFrame)) {
+                framesPopped++;
+                // Verify memory integrity: matrices must remain 100x100 and valid
+                assert(!consFrame.getFrame(CameraRole::STEREO_LEFT).empty());
+                assert(consFrame.getFrame(CameraRole::STEREO_LEFT).rows == 100);
+                assert(consFrame.getFrame(CameraRole::STEREO_LEFT).cols == 100);
+                assert(consFrame.timestamp > prevTs);
+                prevTs = consFrame.timestamp;
+            } else {
+                std::this_thread::yield();
+            }
+        }
+    });
+
+    producer.join();
+    consumer.join();
+
+    assert(framesPopped > 0);
+    spdlog::info("[TEST] AtomicRingBuffer overwrite verification passed (popped {}/{} frames under heavy contention).",
+                 framesPopped.load(), TOTAL_PRODUCE);
+}
+
+void testAsyncFlightRecorderStream() {
+    std::string testDir = "build/stream_test";
+    std::filesystem::remove_all(testDir);
+
+    FlightRecorder recorder(testDir);
+
+    std::vector<RecordedFrame> streamFrames;
+    for (int i = 0; i < 20; ++i) {
+        RecordedFrame f;
+        f.timestamp = 1000 + i;
+        f.leftFrame = cv::Mat::zeros(80, 80, CV_8UC1);
+        f.rightFrame = cv::Mat::zeros(80, 80, CV_8UC1);
+        cv::circle(f.leftFrame, cv::Point(40, 40), 10, cv::Scalar(255), -1);
+        cv::circle(f.rightFrame, cv::Point(40, 40), 10, cv::Scalar(255), -1);
+        f.triggerDiag = {{"frame", i}};
+        streamFrames.push_back(f);
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    recorder.saveStreamSession(streamFrames);
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    // saveStreamSession must be asynchronous: return immediately (< 10 ms)
+    spdlog::info("[TEST] saveStreamSession non-blocking latency: {} us", duration.count());
+    assert(duration.count() < 10000); // Less than 10 ms
+
+    // Wait for background worker to complete writing files
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    // Verify stream folder and contents
+    bool foundStreamDir = false;
+    for (const auto& entry : std::filesystem::directory_iterator(testDir)) {
+        if (entry.is_directory() && entry.path().filename().string().rfind("stream_", 0) == 0) {
+            foundStreamDir = true;
+            assert(std::filesystem::exists(entry.path() / "raw"));
+            assert(std::filesystem::exists(entry.path() / "annotated"));
+            assert(std::filesystem::exists(entry.path() / "metadata.json"));
+
+            // Check that left and right PNGs exist
+            assert(std::filesystem::exists(entry.path() / "raw" / "left_000.png"));
+            assert(std::filesystem::exists(entry.path() / "raw" / "right_000.png"));
+        }
+    }
+    assert(foundStreamDir);
+
+    std::filesystem::remove_all(testDir);
+    spdlog::info("[TEST] Async FlightRecorder stream verification passed.");
+}
+
 void runMathTests() {
     spdlog::info("============================================");
     spdlog::info("Starting C++ Math Verification Tests...");
@@ -481,6 +630,8 @@ void runMathTests() {
     testStereoTriangulatorAndRaySphere();
     testKinematicsEngine();
     testFlightRecorder();
+    testAtomicRingBufferOverwrite();
+    testAsyncFlightRecorderStream();
 
     spdlog::info("============================================");
     spdlog::info("All C++ Math Verification Tests PASSED!");

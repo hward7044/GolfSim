@@ -26,4 +26,26 @@ public:
             f = cv::Mat(height, width, CV_8UC1);
         }
     }
+
+    /// Zero-copy fast pointer swap between two FrameSets
+    void swap(FrameSet& other) noexcept {
+        std::swap(timestamp, other.timestamp);
+        for (std::size_t i = 0; i < CAMERA_ROLE_COUNT; ++i) {
+            std::swap(frames[i], other.frames[i]);
+        }
+    }
+
+    friend void swap(FrameSet& a, FrameSet& b) noexcept {
+        a.swap(b);
+    }
+
+    /// Deep copy matrix pixels into pre-allocated destination without reallocation
+    void copyTo(FrameSet& dest) const {
+        dest.timestamp = timestamp;
+        for (std::size_t i = 0; i < CAMERA_ROLE_COUNT; ++i) {
+            if (!frames[i].empty()) {
+                frames[i].copyTo(dest.frames[i]);
+            }
+        }
+    }
 };

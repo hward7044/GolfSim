@@ -25,7 +25,14 @@ struct RecordedFrame {
 
 class FlightRecorder {
 private:
+    enum class TaskType {
+        SHOT,
+        STREAM
+    };
+
     struct SaveTask {
+        TaskType type = TaskType::SHOT;
+        std::string sessionTimestamp;
         std::vector<RecordedFrame> frames;
         LaunchData<Degrees, MilesPerHour> launchData;
     };
@@ -41,6 +48,7 @@ private:
     void workerLoop();
     void enforceLimit();
     void processSaveTask(const SaveTask& task);
+    void processStreamTask(const SaveTask& task);
 public:
     FlightRecorder(const std::string& outDir = "build/replays");
     ~FlightRecorder();

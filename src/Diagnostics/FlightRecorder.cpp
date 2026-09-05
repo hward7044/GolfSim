@@ -47,7 +47,11 @@ void FlightRecorder::workerLoop() {
             taskQueue.pop();
         }
 
-        processSaveTask(task);
+        if (task.type == TaskType::STREAM) {
+            processStreamTask(task);
+        } else {
+            processSaveTask(task);
+        }
     }
 }
 
@@ -57,7 +61,7 @@ void FlightRecorder::enforceLimit() {
         for (const auto& entry : fs::directory_iterator(outputDirectory)) {
             if (entry.is_directory()) {
                 std::string name = entry.path().filename().string();
-                if (name.rfind("shot_", 0) == 0) {
+                if (name.rfind("shot_", 0) == 0 || name.rfind("stream_", 0) == 0) {
                     replays.push_back(entry.path());
                 }
             }
@@ -87,6 +91,7 @@ void FlightRecorder::saveSession(
 
     // Prepare and clone task data in the consumer thread to decouple from state machine pool reuse
     SaveTask task;
+    task.type = TaskType::SHOT;
     task.launchData = launchData;
     task.frames.reserve(frames.size());
 
@@ -99,12 +104,12 @@ void FlightRecorder::saveSession(
         clonedFrame.leftVisionDiag = f.leftVisionDiag;
         clonedFrame.rightVisionDiag = f.rightVisionDiag;
         clonedFrame.triangulatedBalls = f.triangulatedBalls;
-        task.frames.push_back(clonedFrame);
+        task.frames.push_back(std::move(clonedFrame));
     }
 
     {
         std::lock_guard<std::mutex> lock(queueMutex);
-        taskQueue.push(task);
+        taskQueue.push(std::move(task));
     }
     cvQueue.notify_one();
 }
@@ -138,7 +143,32 @@ void FlightRecorder::saveStreamSession(
              << std::setw(2) << bt.tm_sec << "_"
              << std::setw(3) << ms.count();
 
-    std::filesystem::path replayPath = std::filesystem::path(outputDirectory) / ssFolder.str();
+    SaveTask task;
+    task.type = TaskType::STREAM;
+    task.sessionTimestamp = ssFolder.str();
+    task.frames.reserve(frames.size());
+
+    for (const auto& f : frames) {
+        RecordedFrame clonedFrame;
+        clonedFrame.timestamp = f.timestamp;
+        clonedFrame.leftFrame = f.leftFrame.clone();   // Deep copy
+        clonedFrame.rightFrame = f.rightFrame.clone(); // Deep copy
+        clonedFrame.triggerDiag = f.triggerDiag;
+        clonedFrame.leftVisionDiag = f.leftVisionDiag;
+        clonedFrame.rightVisionDiag = f.rightVisionDiag;
+        clonedFrame.triangulatedBalls = f.triangulatedBalls;
+        task.frames.push_back(std::move(clonedFrame));
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        taskQueue.push(std::move(task));
+    }
+    cvQueue.notify_one();
+}
+
+void FlightRecorder::processStreamTask(const SaveTask& task) {
+    std::filesystem::path replayPath = std::filesystem::path(outputDirectory) / task.sessionTimestamp;
     std::filesystem::path rawPath = replayPath / "raw";
     std::filesystem::path annotatedPath = replayPath / "annotated";
 
@@ -152,13 +182,13 @@ void FlightRecorder::saveStreamSession(
 
     nlohmann::json jMeta;
     jMeta["sessionType"] = "stream";
-    jMeta["timestamp"] = ssFolder.str();
-    jMeta["frameCount"] = frames.size();
+    jMeta["timestamp"] = task.sessionTimestamp;
+    jMeta["frameCount"] = task.frames.size();
 
     nlohmann::json jFrames = nlohmann::json::array();
 
-    for (size_t i = 0; i < frames.size(); ++i) {
-        const auto& f = frames[i];
+    for (size_t i = 0; i < task.frames.size(); ++i) {
+        const auto& f = task.frames[i];
 
         std::ostringstream ssIdx;
         ssIdx << std::setfill('0') << std::setw(3) << i;
