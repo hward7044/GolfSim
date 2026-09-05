@@ -43,6 +43,8 @@
 #include "Math/StereoTriangulator.hpp"
 #include "Math/TcpJsonTransmitter.hpp"
 #include "Orchestration/SessionStateMachine.hpp"
+// Verified: Btrfs NOCOW index stability check
+#include "Orchestration/PipelineTimingConfig.hpp"
 #include "Orchestration/ThreadManager.hpp"
 #include <filesystem>
 #include <fstream>
@@ -244,8 +246,16 @@ int main(int argc, char *argv[]) {
   auto kinematics = EigenBallisticsEngine();
   auto network = TcpJsonTransmitter("127.0.0.1", 9002);
 
+  PipelineTimingConfig timingConfig;
+  timingConfig.workingDistanceMeters = 0.9144; // 3.0 ft
+  timingConfig.nominalBallRadiusPx   = 23.3;   // ~23.3 px radius at 3.0 ft
+  timingConfig.pulseIntervalMs       = 1.0;    // 1.0 ms strobe spacing
+  timingConfig.minPointsToSolve      = 3;      // Minimum 3 points
+  timingConfig.maxFramesPerShot      = 2;      // 2 frames maximum for irons/wedges
+  timingConfig.emptyFrameTimeout     = 1;      // Solve immediately on 1st empty frame
+
   auto stateMachine = std::make_shared<ConcreteSSM>(trigger, vision, spatial,
-                                                    kinematics, network);
+                                                    kinematics, network, timingConfig);
 
   if (streamMode) {
     spdlog::info("[System] Stream Recording Mode Enabled! Chunk size: {} frames", streamFrames);
@@ -319,8 +329,7 @@ void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& co
     nodeL = std::make_shared<OV9281CameraNode>(
         std::move(usbDriverLeft), CameraRole::STEREO_LEFT);
     cameraSystem.addCameraNode(nodeL);
-    nodeL->enableHardwareStrobeMode();
-    std::cout << "Successfully initialized Left camera (" << width << "x" << height << ") [Strobe Enabled]" << std::endl;
+    std::cout << "Successfully initialized Left camera (" << width << "x" << height << ")" << std::endl;
   }
 
   if (rightOk) {
@@ -329,8 +338,7 @@ void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& co
     nodeR = std::make_shared<OV9281CameraNode>(
         std::move(usbDriverRight), CameraRole::STEREO_RIGHT);
     cameraSystem.addCameraNode(nodeR);
-    nodeR->enableHardwareStrobeMode();
-    std::cout << "Successfully initialized Right camera (" << width << "x" << height << ") [Strobe Enabled]" << std::endl;
+    std::cout << "Successfully initialized Right camera (" << width << "x" << height << ")" << std::endl;
   }
 
   FrameSet frameSet;

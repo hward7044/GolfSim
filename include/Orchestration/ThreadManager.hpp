@@ -62,4 +62,18 @@ public:
     
     // Stop all threads cleanly
     void stop();
+
+    // Timing configuration pass-through
+    void setTimingConfig(const PipelineTimingConfig& config) {
+        if (stateMachine) {
+            stateMachine->setTimingConfig(config);
+        }
+    }
+
+    PipelineTimingConfig getTimingConfig() const {
+        if (stateMachine) {
+            return stateMachine->getTimingConfig();
+        }
+        return PipelineTimingConfig();
+    }
 };

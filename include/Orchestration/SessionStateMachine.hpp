@@ -6,6 +6,7 @@
 #include "Math/IKinematicsSolver.hpp"
 #include "Math/INetworkTransmitter.hpp"
 #include "Diagnostics/FlightRecorder.hpp"
+#include "Orchestration/PipelineTimingConfig.hpp"
 
 #include <vector>
 #include <fstream>
@@ -61,11 +62,15 @@ private:
     Net            network;
     FlightRecorder recorder;
 
+    // Timing and optical configuration
+    PipelineTimingConfig timingConfig;
+
     // Track state across incoming frames
     std::vector<Ball3D> trajectoryBuffer;
     std::vector<RecordedFrame> recordedFramesPool;
     size_t         recordedFrameCount = 0;
     int            emptyFrameCount = 0;
+    int            shotFrameCount = 0;
     bool           inShot = false;
 
     bool           streamRecordingMode = false;
@@ -112,12 +117,14 @@ public:
         Vision v = Vision(),
         Spatial s = Spatial(),
         Kinematics k = Kinematics(),
-        Net n = Net()
+        Net n = Net(),
+        PipelineTimingConfig timing = PipelineTimingConfig()
     ) : trigger(std::move(t)),
         vision(std::move(v)),
         spatial(std::move(s)),
         kinematics(std::move(k)),
-        network(std::move(n)) {
+        network(std::move(n)),
+        timingConfig(timing) {
         // Pre-allocate 40 recorded frames for zero-allocation copying in the hot path
         recordedFramesPool.resize(40);
         for (auto& rf : recordedFramesPool) {
@@ -125,6 +132,9 @@ public:
             rf.rightFrame = cv::Mat(800, 1280, CV_8UC1);
         }
     }
+
+    const PipelineTimingConfig& getTimingConfig() const { return timingConfig; }
+    void setTimingConfig(const PipelineTimingConfig& config) { timingConfig = config; }
 
     void setStreamRecordingMode(bool enable, int frameLimit = 50) {
         streamRecordingMode = enable;
@@ -180,6 +190,7 @@ public:
                 trajectoryBuffer.clear();
                 recordedFrameCount = 0;
                 emptyFrameCount = 0;
+                shotFrameCount = 0;
                 trigDiag = getTelemetry(trigger);
                 spdlog::info("[SessionStateMachine] Impact trigger confirmed! Starting shot capture...");
             }
@@ -187,6 +198,8 @@ public:
 
         // 2. If swing is triggered, detect and triangulate coordinates
         if (inShot) {
+            shotFrameCount++;
+
             auto leftBalls = vision.detectBalls(leftFrame);
             nlohmann::json leftVisionDiag = getTelemetry(vision);
 
@@ -220,17 +233,23 @@ public:
                 recordedFrameCount++;
             }
 
-            // 3. Option C Completion Check:
-            //    - emptyFrameCount >= 15 (ball has left the frame) OR
-            //    - trajectoryBuffer.size() >= 25 (safety cutoff)
-            if (emptyFrameCount >= 15 || trajectoryBuffer.size() >= 25) {
-                spdlog::info("[SessionStateMachine] Shot capture completed. Buffered points: {}, Empty frames: {}", 
-                             trajectoryBuffer.size(), emptyFrameCount);
+            // 3. Low-Latency 1-to-2 Frame Hybrid Completion Check:
+            //    - Ball exited: Seen pulses previously and consecutive empty frames >= emptyFrameTimeout (default: 1)
+            //    - Frame limit reached: Captured maxFramesPerShot (default: 2)
+            //    - Point buffer full: Accumulated maxFramesPerShot * 5 pulses
+            bool ballExited = (!trajectoryBuffer.empty() && emptyFrameCount >= timingConfig.emptyFrameTimeout);
+            bool frameLimitReached = (shotFrameCount >= timingConfig.maxFramesPerShot);
+            bool pointBufferFull = (trajectoryBuffer.size() >= static_cast<size_t>(timingConfig.maxFramesPerShot * 5));
 
-                if (trajectoryBuffer.size() >= 3) {
-                    spdlog::info("[SessionStateMachine] Solving shot kinematics...");
-                    // Strobe interval is 1.0ms
-                    LaunchData<Degrees, MilesPerHour> launchData = kinematics.solveKinematics(trajectoryBuffer, 1.0);
+            if (ballExited || frameLimitReached || pointBufferFull) {
+                spdlog::info("[SessionStateMachine] Shot capture completed. Buffered points: {}, Shot frames: {}, Empty frames: {}", 
+                             trajectoryBuffer.size(), shotFrameCount, emptyFrameCount);
+
+                if (trajectoryBuffer.size() >= static_cast<size_t>(timingConfig.minPointsToSolve)) {
+                    spdlog::info("[SessionStateMachine] Solving shot kinematics (pulseInterval: {:.2f} ms)...",
+                                 timingConfig.pulseIntervalMs);
+                    LaunchData<Degrees, MilesPerHour> launchData = 
+                        kinematics.solveKinematics(trajectoryBuffer, timingConfig.pulseIntervalMs);
 
                     spdlog::info("[SessionStateMachine] Shot Solved: Speed={:.1f} mph | VLA={:.1f} deg | HLA={:.1f} deg | Spin={:.0f} RPM",
                                  launchData.ballSpeed.value(), launchData.verticalLaunchAngle.value(),
@@ -246,8 +265,8 @@ public:
                     std::vector<RecordedFrame> activeFrames(recordedFramesPool.begin(), recordedFramesPool.begin() + recordedFrameCount);
                     recorder.saveSession(activeFrames, launchData);
                 } else {
-                    spdlog::warn("[SessionStateMachine] Trajectory buffer has insufficient points ({}) to solve. Shot discarded.", 
-                                 trajectoryBuffer.size());
+                    spdlog::warn("[SessionStateMachine] Trajectory buffer has insufficient points ({} < {}) to solve. Shot discarded.", 
+                                 trajectoryBuffer.size(), timingConfig.minPointsToSolve);
                 }
 
                 // Reset state parameters
@@ -255,6 +274,7 @@ public:
                 trajectoryBuffer.clear();
                 recordedFrameCount = 0;
                 emptyFrameCount = 0;
+                shotFrameCount = 0;
                 trigger.reset();
             }
         }

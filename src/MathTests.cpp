@@ -7,6 +7,8 @@
 #include "Math/AtomicRingBuffer.hpp"
 #include "Camera/FrameSet.hpp"
 #include "Diagnostics/FlightRecorder.hpp"
+#include "Orchestration/SessionStateMachine.hpp"
+#include "Orchestration/PipelineTimingConfig.hpp"
 #include <Eigen/Geometry>
 #include <opencv2/imgproc.hpp>
 #include <spdlog/spdlog.h>
@@ -619,6 +621,197 @@ void testAsyncFlightRecorderStream() {
     spdlog::info("[TEST] Async FlightRecorder stream verification passed.");
 }
 
+// Mock components for testing SessionStateMachine in isolation
+struct MockStrobeTrigger {
+    static inline bool fireOnNext = false;
+    bool checkTrigger(const cv::Mat&, const cv::Mat&) {
+        if (fireOnNext) {
+            fireOnNext = false;
+            return true;
+        }
+        return false;
+    }
+    void reset() { fireOnNext = false; }
+};
+
+struct MockStrobeVision : public IComputerVision {
+    static inline std::vector<BallObservation> returnObs;
+    std::vector<BallObservation> detectBalls(const cv::Mat&) override {
+        return returnObs;
+    }
+};
+
+struct MockStrobeSpatial : public ISpatialSolver {
+    static inline std::vector<Ball3D> returnBalls;
+    std::vector<Ball3D> triangulateShot(
+        const std::vector<BallObservation>&,
+        const std::vector<BallObservation>&
+    ) override {
+        return returnBalls;
+    }
+};
+
+struct MockStrobeKinematics : public IKinematicsSolver {
+    static inline double lastPulseIntervalMs = 0.0;
+    static inline size_t lastTrajectorySize = 0;
+    LaunchData<Degrees, MilesPerHour> solveKinematics(const std::vector<Ball3D>& trajectory, double pulseIntervalMs) override {
+        lastTrajectorySize = trajectory.size();
+        lastPulseIntervalMs = pulseIntervalMs;
+        LaunchData<Degrees, MilesPerHour> ld;
+        ld.ballSpeed = MilesPerHour(85.0);
+        ld.verticalLaunchAngle = Degrees(14.0);
+        ld.horizontalLaunchAngle = Degrees(1.0);
+        ld.spinRPM = 6500.0;
+        ld.spinAxis = Eigen::Vector3d(0, 1, 0);
+        return ld;
+    }
+};
+
+struct MockStrobeNet : public INetworkTransmitter {
+    static inline bool transmitted = false;
+    bool transmitLaunchData(const LaunchData<Degrees, MilesPerHour>&) override {
+        transmitted = true;
+        return true;
+    }
+};
+
+void testSessionStateMachineStroboscopicTiming() {
+    // 1. Verify 3.0 ft default geometry in PipelineTimingConfig
+    PipelineTimingConfig config;
+    assert(std::abs(config.workingDistanceMeters - 0.9144) < 1e-4);
+    assert(std::abs(config.pulseIntervalMs - 1.0) < 1e-4);
+    assert(config.minPointsToSolve == 3);
+    assert(config.maxFramesPerShot == 2);
+    assert(config.emptyFrameTimeout == 1);
+    assert(std::abs(config.nominalBallRadiusPx - 23.3) < 0.1);
+
+    // Helper to generate a dummy FrameSet
+    auto makeFrameSet = []() {
+        FrameSet fs;
+        fs.preallocate(1280, 800);
+        fs.timestamp = 1000;
+        return fs;
+    };
+
+    // Helper to generate N Ball3D points
+    auto makeBalls = [](int count) {
+        std::vector<Ball3D> balls;
+        for (int i = 0; i < count; ++i) {
+            Ball3D b;
+            b.centroid = Eigen::Vector3d(0.1 * i, 0.0, 0.9144);
+            balls.push_back(b);
+        }
+        return balls;
+    };
+
+    // 2. Test Case 1: Low-Latency High-Speed Exit (Frame 1 has 5 pulses, Frame 2 is empty)
+    {
+        MockStrobeTrigger::fireOnNext = false;
+        MockStrobeVision::returnObs.clear();
+        MockStrobeSpatial::returnBalls.clear();
+        MockStrobeKinematics::lastTrajectorySize = 0;
+        MockStrobeKinematics::lastPulseIntervalMs = 0.0;
+        MockStrobeNet::transmitted = false;
+
+        MockStrobeTrigger trig;
+        MockStrobeVision vis;
+        MockStrobeSpatial spat;
+        MockStrobeKinematics kin;
+        MockStrobeNet net;
+
+        SessionStateMachine<MockStrobeTrigger, MockStrobeVision, MockStrobeSpatial, MockStrobeKinematics, MockStrobeNet>
+            ssm(trig, vis, spat, kin, net, config);
+
+        // Frame 0: Trigger fires! Vision finds 5 pulses
+        MockStrobeTrigger::fireOnNext = true;
+        MockStrobeVision::returnObs.resize(5);
+        MockStrobeSpatial::returnBalls = makeBalls(5);
+
+        ssm.processNextFrame(makeFrameSet());
+        assert(!MockStrobeNet::transmitted); // In-flight, waiting to confirm completion
+
+        // Frame 1: Ball has exited FOV! Vision finds 0 pulses
+        MockStrobeVision::returnObs.clear();
+        MockStrobeSpatial::returnBalls.clear();
+
+        ssm.processNextFrame(makeFrameSet());
+        // With emptyFrameTimeout = 1, it must solve IMMEDIATELY without waiting 15 frames!
+        assert(MockStrobeNet::transmitted);
+        assert(MockStrobeKinematics::lastTrajectorySize == 5);
+        assert(std::abs(MockStrobeKinematics::lastPulseIntervalMs - 1.0) < 1e-4);
+    }
+
+    // 3. Test Case 2: 2-Frame Hybrid Accumulation for Irons (Frame 1 + Frame 2)
+    {
+        MockStrobeTrigger::fireOnNext = false;
+        MockStrobeVision::returnObs.clear();
+        MockStrobeSpatial::returnBalls.clear();
+        MockStrobeKinematics::lastTrajectorySize = 0;
+        MockStrobeKinematics::lastPulseIntervalMs = 0.0;
+        MockStrobeNet::transmitted = false;
+
+        MockStrobeTrigger trig;
+        MockStrobeVision vis;
+        MockStrobeSpatial spat;
+        MockStrobeKinematics kin;
+        MockStrobeNet net;
+
+        SessionStateMachine<MockStrobeTrigger, MockStrobeVision, MockStrobeSpatial, MockStrobeKinematics, MockStrobeNet>
+            ssm(trig, vis, spat, kin, net, config);
+
+        // Frame 0: Trigger fires! 5 pulses captured in Frame 1
+        MockStrobeTrigger::fireOnNext = true;
+        MockStrobeVision::returnObs.resize(5);
+        MockStrobeSpatial::returnBalls = makeBalls(5);
+        ssm.processNextFrame(makeFrameSet());
+        assert(!MockStrobeNet::transmitted);
+
+        // Frame 1: Ball still in FOV! 5 more pulses captured in Frame 2
+        ssm.processNextFrame(makeFrameSet());
+        // Frame limit reached (shotFrameCount == maxFramesPerShot == 2) -> solves across 10 points!
+        assert(MockStrobeNet::transmitted);
+        assert(MockStrobeKinematics::lastTrajectorySize == 10);
+        assert(std::abs(MockStrobeKinematics::lastPulseIntervalMs - 1.0) < 1e-4);
+    }
+
+    // 4. Test Case 3: Custom Timing Configuration (pulseIntervalMs = 0.8, minPointsToSolve = 4)
+    {
+        MockStrobeTrigger::fireOnNext = false;
+        MockStrobeVision::returnObs.clear();
+        MockStrobeSpatial::returnBalls.clear();
+        MockStrobeKinematics::lastTrajectorySize = 0;
+        MockStrobeKinematics::lastPulseIntervalMs = 0.0;
+        MockStrobeNet::transmitted = false;
+
+        PipelineTimingConfig customConfig;
+        customConfig.pulseIntervalMs = 0.8;
+        customConfig.minPointsToSolve = 4;
+        customConfig.maxFramesPerShot = 1;
+        customConfig.emptyFrameTimeout = 1;
+
+        MockStrobeTrigger trig;
+        MockStrobeVision vis;
+        MockStrobeSpatial spat;
+        MockStrobeKinematics kin;
+        MockStrobeNet net;
+
+        SessionStateMachine<MockStrobeTrigger, MockStrobeVision, MockStrobeSpatial, MockStrobeKinematics, MockStrobeNet>
+            ssm(trig, vis, spat, kin, net, customConfig);
+
+        MockStrobeTrigger::fireOnNext = true;
+        MockStrobeVision::returnObs.resize(4);
+        MockStrobeSpatial::returnBalls = makeBalls(4);
+
+        ssm.processNextFrame(makeFrameSet());
+        // maxFramesPerShot == 1 reached immediately!
+        assert(MockStrobeNet::transmitted);
+        assert(MockStrobeKinematics::lastTrajectorySize == 4);
+        assert(std::abs(MockStrobeKinematics::lastPulseIntervalMs - 0.8) < 1e-4);
+    }
+
+    spdlog::info("[TEST] SessionStateMachine stroboscopic timing and 3.0 ft geometry verification passed.");
+}
+
 void runMathTests() {
     spdlog::info("============================================");
     spdlog::info("Starting C++ Math Verification Tests...");
@@ -633,6 +826,7 @@ void runMathTests() {
     testFlightRecorder();
     testAtomicRingBufferOverwrite();
     testAsyncFlightRecorderStream();
+    testSessionStateMachineStroboscopicTiming();
 
     spdlog::info("============================================");
     spdlog::info("All C++ Math Verification Tests PASSED!");
