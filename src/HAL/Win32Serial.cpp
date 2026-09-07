@@ -71,7 +71,7 @@ bool Win32Serial::open(const std::string& portName, int baudRate) {
     timeouts.ReadTotalTimeoutMultiplier  = 0;
     timeouts.ReadTotalTimeoutConstant    = 0;
     timeouts.WriteTotalTimeoutMultiplier = 0;
-    timeouts.WriteTotalTimeoutConstant   = 50; // Allow max 50ms write blocking
+    timeouts.WriteTotalTimeoutConstant   = 10; // Low-latency 10ms non-blocking write completion
 
     if (!SetCommTimeouts(hSerial_, &timeouts)) {
         DWORD err = GetLastError();
@@ -119,6 +119,29 @@ bool Win32Serial::writeString(const std::string& data) {
     }
 
     return true;
+}
+
+bool Win32Serial::writeChar(char c) {
+    if (hSerial_ == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    DWORD bytesWritten = 0;
+    BOOL result = WriteFile(
+        hSerial_,
+        &c,
+        1,
+        &bytesWritten,
+        nullptr
+    );
+
+    return (result && bytesWritten == 1);
+}
+
+void Win32Serial::flush() {
+    if (hSerial_ != INVALID_HANDLE_VALUE) {
+        PurgeComm(hSerial_, PURGE_TXABORT | PURGE_TXCLEAR);
+    }
 }
 
 #endif

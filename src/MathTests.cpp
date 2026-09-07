@@ -84,8 +84,24 @@ void testBallPresenceTrigger() {
     nlohmann::json diagReset = trigger.getLatestDiagnostics();
     assert(diagReset["state"] == "WAITING_FOR_BALL");
     assert(diagReset["stabilityCounter"] == 0);
+    assert(trigger.getEmitterMode() == EmitterPowerMode::HIGH_STROBE_READY);
 
-    spdlog::info("[TEST] BallPresenceTrigger verification passed.");
+    // Emitter Protection Test: Fast loss timeout (50ms)
+    trigger.setLossTimeoutSec(0.05); // 50 ms test timeout
+    trigger.checkOpticalGate(blankFrame); // Starts empty timer
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    trigger.checkOpticalGate(blankFrame); // Triggers timeout
+    assert(trigger.getEmitterMode() == EmitterPowerMode::LOW_STANDBY);
+    assert(trigger.isStandbyRequested());
+    nlohmann::json diagStandby = trigger.getLatestDiagnostics();
+    assert(diagStandby["emitterMode"] == "STANDBY");
+
+    // Restoring ball on tee immediately wakes up to HIGH_STROBE_READY
+    trigger.checkOpticalGate(ballFrame);
+    assert(trigger.getEmitterMode() == EmitterPowerMode::HIGH_STROBE_READY);
+    assert(!trigger.isStandbyRequested());
+
+    spdlog::info("[TEST] BallPresenceTrigger verification passed (including dynamic emitter protection).");
 }
 
 void testOpenCVMomentsTracker() {
@@ -679,11 +695,17 @@ void testSessionStateMachineStroboscopicTiming() {
     // 1. Verify 3.0 ft default geometry in PipelineTimingConfig
     PipelineTimingConfig config;
     assert(std::abs(config.workingDistanceMeters - 0.9144) < 1e-4);
-    assert(std::abs(config.pulseIntervalMs - 1.0) < 1e-4);
+    assert(std::abs(config.pulseIntervalMs - 3.3333) < 1e-3);
     assert(config.minPointsToSolve == 3);
     assert(config.maxFramesPerShot == 2);
     assert(config.emptyFrameTimeout == 1);
     assert(std::abs(config.nominalBallRadiusPx - 23.3) < 0.1);
+    assert(config.highStrobeRateHz == 300.0);
+    assert(config.standbyStrobeRateHz == 10.0);
+    assert(config.cameraExposureUs == 10000);
+    assert(config.strobePulseCount == 3);
+    assert(config.ballLossTimeoutSec == 5.0);
+    assert(config.isValidTiming());
 
     // Helper to generate a dummy FrameSet
     auto makeFrameSet = []() {
@@ -738,7 +760,7 @@ void testSessionStateMachineStroboscopicTiming() {
         // With emptyFrameTimeout = 1, it must solve IMMEDIATELY without waiting 15 frames!
         assert(MockStrobeNet::transmitted);
         assert(MockStrobeKinematics::lastTrajectorySize == 5);
-        assert(std::abs(MockStrobeKinematics::lastPulseIntervalMs - 1.0) < 1e-4);
+        assert(std::abs(MockStrobeKinematics::lastPulseIntervalMs - 3.3333) < 1e-3);
     }
 
     // 3. Test Case 2: 2-Frame Hybrid Accumulation for Irons (Frame 1 + Frame 2)
@@ -771,7 +793,7 @@ void testSessionStateMachineStroboscopicTiming() {
         // Frame limit reached (shotFrameCount == maxFramesPerShot == 2) -> solves across 10 points!
         assert(MockStrobeNet::transmitted);
         assert(MockStrobeKinematics::lastTrajectorySize == 10);
-        assert(std::abs(MockStrobeKinematics::lastPulseIntervalMs - 1.0) < 1e-4);
+        assert(std::abs(MockStrobeKinematics::lastPulseIntervalMs - 3.3333) < 1e-3);
     }
 
     // 4. Test Case 3: Custom Timing Configuration (pulseIntervalMs = 0.8, minPointsToSolve = 4)

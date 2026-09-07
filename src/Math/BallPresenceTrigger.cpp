@@ -11,7 +11,8 @@ BallPresenceTrigger::BallPresenceTrigger(
     double minArea,
     double maxArea,
     double minCirc,
-    float matchThreshold
+    float matchThreshold,
+    double lossTimeout
 ) : teeROI(roi),
     lockFrameCount(lockFrames),
     ballThreshold(thresh),
@@ -19,9 +20,12 @@ BallPresenceTrigger::BallPresenceTrigger(
     maxBallArea(maxArea),
     minCircularity(minCirc),
     matchScoreThreshold(matchThreshold),
+    lossTimeoutSec(lossTimeout),
     state(TriggerState::WAITING_FOR_BALL),
     stabilityCounter(0),
-    lastCandidateCentroid(0, 0) {
+    lastCandidateCentroid(0, 0),
+    hasEmptyStartTime(false),
+    emitterMode(EmitterPowerMode::HIGH_STROBE_READY) {
     
     latestDiag = {
         {"state", "WAITING_FOR_BALL"},
@@ -30,7 +34,9 @@ BallPresenceTrigger::BallPresenceTrigger(
         {"lockFrameCount", lockFrameCount},
         {"matchScore", 1.0f},
         {"teeROI", {teeROI.x, teeROI.y, teeROI.width, teeROI.height}},
-        {"lockedBallBox", {0, 0, 0, 0}}
+        {"lockedBallBox", {0, 0, 0, 0}},
+        {"emitterMode", "READY"},
+        {"emptyDurationSec", 0.0}
     };
 }
 
@@ -91,6 +97,10 @@ bool BallPresenceTrigger::checkOpticalGate(const cv::Mat& currentFrame) {
         }
 
         if (validCount == 1) {
+            // Ball candidate detected -> restore High Strobe Ready
+            hasEmptyStartTime = false;
+            emitterMode = EmitterPowerMode::HIGH_STROBE_READY;
+
             double dist = cv::norm(validCentroid - lastCandidateCentroid);
             if (stabilityCounter > 0 && dist < 15.0) {
                 stabilityCounter++;
@@ -121,8 +131,25 @@ bool BallPresenceTrigger::checkOpticalGate(const cv::Mat& currentFrame) {
             }
         } else {
             stabilityCounter = 0;
+
+            // Track how long tee has been empty to enforce emitter protection
+            auto now = std::chrono::steady_clock::now();
+            if (!hasEmptyStartTime) {
+                emptyStartTime = now;
+                hasEmptyStartTime = true;
+            } else {
+                double emptySec = std::chrono::duration<double>(now - emptyStartTime).count();
+                if (emptySec >= lossTimeoutSec) {
+                    if (emitterMode != EmitterPowerMode::LOW_STANDBY) {
+                        spdlog::info("[BallPresenceTrigger] Tee unoccupied for {:.1f}s >= {:.1f}s threshold. Entering LOW_STANDBY emitter protection.",
+                                     emptySec, lossTimeoutSec);
+                    }
+                    emitterMode = EmitterPowerMode::LOW_STANDBY;
+                }
+            }
         }
 
+        double emptySec = hasEmptyStartTime ? std::chrono::duration<double>(std::chrono::steady_clock::now() - emptyStartTime).count() : 0.0;
         latestDiag = {
             {"state", (state == TriggerState::BALL_LOCKED) ? "BALL_LOCKED" : "WAITING_FOR_BALL"},
             {"triggered", false},
@@ -131,11 +158,16 @@ bool BallPresenceTrigger::checkOpticalGate(const cv::Mat& currentFrame) {
             {"matchScore", 1.0f},
             {"teeROI", {safeTeeRoi.x, safeTeeRoi.y, safeTeeRoi.width, safeTeeRoi.height}},
             {"candidateCentroid", {validCentroid.x, validCentroid.y}},
-            {"lockedBallBox", {lockedBallBox.x, lockedBallBox.y, lockedBallBox.width, lockedBallBox.height}}
+            {"lockedBallBox", {lockedBallBox.x, lockedBallBox.y, lockedBallBox.width, lockedBallBox.height}},
+            {"emitterMode", (emitterMode == EmitterPowerMode::LOW_STANDBY) ? "STANDBY" : "READY"},
+            {"emptyDurationSec", emptySec}
         };
         return false;
 
     } else if (state == TriggerState::BALL_LOCKED) {
+        hasEmptyStartTime = false;
+        emitterMode = EmitterPowerMode::HIGH_STROBE_READY;
+
         cv::Rect safeLockRoi = lockedBallBox & cv::Rect(0, 0, currentFrame.cols, currentFrame.rows);
         float matchScore = 0.0f;
 
@@ -160,6 +192,9 @@ bool BallPresenceTrigger::checkOpticalGate(const cv::Mat& currentFrame) {
 
         if (departed) {
             state = TriggerState::BALL_DEPARTED;
+            emptyStartTime = std::chrono::steady_clock::now();
+            hasEmptyStartTime = true;
+
             spdlog::info("[BallPresenceTrigger] Ball departed! 2D pixel match score {:.2f} < threshold {:.2f}. Triggering shot!",
                          matchScore, matchScoreThreshold);
 
@@ -170,7 +205,9 @@ bool BallPresenceTrigger::checkOpticalGate(const cv::Mat& currentFrame) {
                 {"lockFrameCount", lockFrameCount},
                 {"matchScore", matchScore},
                 {"teeROI", {safeTeeRoi.x, safeTeeRoi.y, safeTeeRoi.width, safeTeeRoi.height}},
-                {"lockedBallBox", {lockedBallBox.x, lockedBallBox.y, lockedBallBox.width, lockedBallBox.height}}
+                {"lockedBallBox", {lockedBallBox.x, lockedBallBox.y, lockedBallBox.width, lockedBallBox.height}},
+                {"emitterMode", "READY"},
+                {"emptyDurationSec", 0.0}
             };
             return true;
         } else {
@@ -181,12 +218,26 @@ bool BallPresenceTrigger::checkOpticalGate(const cv::Mat& currentFrame) {
                 {"lockFrameCount", lockFrameCount},
                 {"matchScore", matchScore},
                 {"teeROI", {safeTeeRoi.x, safeTeeRoi.y, safeTeeRoi.width, safeTeeRoi.height}},
-                {"lockedBallBox", {lockedBallBox.x, lockedBallBox.y, lockedBallBox.width, lockedBallBox.height}}
+                {"lockedBallBox", {lockedBallBox.x, lockedBallBox.y, lockedBallBox.width, lockedBallBox.height}},
+                {"emitterMode", "READY"},
+                {"emptyDurationSec", 0.0}
             };
             return false;
         }
 
     } else if (state == TriggerState::BALL_DEPARTED) {
+        auto now = std::chrono::steady_clock::now();
+        if (!hasEmptyStartTime) {
+            emptyStartTime = now;
+            hasEmptyStartTime = true;
+        } else {
+            double emptySec = std::chrono::duration<double>(now - emptyStartTime).count();
+            if (emptySec >= lossTimeoutSec) {
+                emitterMode = EmitterPowerMode::LOW_STANDBY;
+            }
+        }
+
+        double emptySec = hasEmptyStartTime ? std::chrono::duration<double>(std::chrono::steady_clock::now() - emptyStartTime).count() : 0.0;
         latestDiag = {
             {"state", "BALL_DEPARTED"},
             {"triggered", false},
@@ -194,7 +245,9 @@ bool BallPresenceTrigger::checkOpticalGate(const cv::Mat& currentFrame) {
             {"lockFrameCount", lockFrameCount},
             {"matchScore", 0.0f},
             {"teeROI", {safeTeeRoi.x, safeTeeRoi.y, safeTeeRoi.width, safeTeeRoi.height}},
-            {"lockedBallBox", {lockedBallBox.x, lockedBallBox.y, lockedBallBox.width, lockedBallBox.height}}
+            {"lockedBallBox", {lockedBallBox.x, lockedBallBox.y, lockedBallBox.width, lockedBallBox.height}},
+            {"emitterMode", (emitterMode == EmitterPowerMode::LOW_STANDBY) ? "STANDBY" : "READY"},
+            {"emptyDurationSec", emptySec}
         };
         return false;
     }
@@ -208,6 +261,8 @@ void BallPresenceTrigger::reset() {
     lastCandidateCentroid = cv::Point2d(0, 0);
     lockedBallBox = cv::Rect(0, 0, 0, 0);
     lockedBallTemplate.release();
+    hasEmptyStartTime = false;
+    emitterMode = EmitterPowerMode::HIGH_STROBE_READY;
 
     latestDiag = {
         {"state", "WAITING_FOR_BALL"},
@@ -216,6 +271,8 @@ void BallPresenceTrigger::reset() {
         {"lockFrameCount", lockFrameCount},
         {"matchScore", 1.0f},
         {"teeROI", {teeROI.x, teeROI.y, teeROI.width, teeROI.height}},
-        {"lockedBallBox", {0, 0, 0, 0}}
+        {"lockedBallBox", {0, 0, 0, 0}},
+        {"emitterMode", "READY"},
+        {"emptyDurationSec", 0.0}
     };
 }

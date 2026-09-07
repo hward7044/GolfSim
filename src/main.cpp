@@ -43,7 +43,6 @@
 #include "Math/StereoTriangulator.hpp"
 #include "Math/TcpJsonTransmitter.hpp"
 #include "Orchestration/SessionStateMachine.hpp"
-// Verified: Btrfs NOCOW index stability check
 #include "Orchestration/PipelineTimingConfig.hpp"
 #include "Orchestration/ThreadManager.hpp"
 #include <filesystem>
@@ -347,18 +346,24 @@ void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& co
   enum ViewMode { VIEW_BOTH, VIEW_LEFT_ONLY, VIEW_RIGHT_ONLY, VIEW_GLINT_HIGHLIGHT, VIEW_THRESHOLD_MASK };
   int currentMode = VIEW_BOTH;
   int activeThreshold = 200;
-  bool strobeOn = true;
-  int expPresetIdx = 2; // Default 2ms
+  int expPresetIdx = 4; // Default 10ms (10,000 us) to capture 3 pulses at 300 Hz
   const int expPresetsUs[] = { 500, 1000, 2000, 5000, 10000 };
   const int numExpPresets = 5;
+  std::string strobeStatusStr = "STROBE: 300 Hz READY";
+
+  if (serial.isOpen()) {
+      serial.writeChar('H');
+  }
 
   std::cout << "\n=======================================================" << std::endl;
-  std::cout << "GOLFSIM IR STROBE DEBUGGER CONTROLS:" << std::endl;
-  std::cout << "  - Press '1' : Turn IR Illumination CONTINUOUSLY ON ('1')" << std::endl;
-  std::cout << "  - Press '0' : Turn IR Illumination OFF ('0')" << std::endl;
-  std::cout << "  - Press 's' or 'f' : Fire 300ms IR Strobe Burst ('F')" << std::endl;
-  std::cout << "  - Press 'e' : Cycle Exposure (500us -> 1ms -> 2ms -> 5ms -> 10ms)" << std::endl;
-  std::cout << "  - Press 'v' : Cycle View Modes (Both -> Left -> Right -> Glints -> Threshold Mask)" << std::endl;
+  std::cout << "GOLFSIM 300 HZ IR STROBE DEBUGGER CONTROLS:" << std::endl;
+  std::cout << "  - Press 'h' / 'H' : 300 Hz Strobe Active Mode ('H')" << std::endl;
+  std::cout << "  - Press 'l' / 'L' : 10 Hz Standby Protection Mode ('L')" << std::endl;
+  std::cout << "  - Press '1'       : Turn IR Illumination CONTINUOUSLY ON (Aiming)" << std::endl;
+  std::cout << "  - Press '0'       : Turn IR Illumination OFF ('0')" << std::endl;
+  std::cout << "  - Press 's' / 'f' : Fire Single 3-Pulse 300 Hz Test Burst ('F')" << std::endl;
+  std::cout << "  - Press 'e'       : Cycle Exposure (500us -> 1ms -> 2ms -> 5ms -> 10ms)" << std::endl;
+  std::cout << "  - Press 'v'       : Cycle View Modes (Both -> Left -> Right -> Glints -> Threshold Mask)" << std::endl;
   std::cout << "  - Press '+' / '-' : Adjust Glint Threshold (Current: " << activeThreshold << ")" << std::endl;
   std::cout << "  - Press ESC / 'q' : Exit Debugger" << std::endl;
   std::cout << "=======================================================\n" << std::endl;
@@ -393,8 +398,6 @@ void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& co
     cv::Scalar meanRight = rightFrame.empty() ? cv::Scalar(0) : cv::mean(rightFrame);
 
     cv::Mat displayLeft, displayRight;
-
-    std::string strobeStatusStr = strobeOn ? "STROBE: ON [Pin active]" : "STROBE: OFF";
     std::string expStr = "Exp: " + std::to_string(expPresetsUs[expPresetIdx]) + "us";
 
     if (!leftFrame.empty()) {
@@ -416,7 +419,7 @@ void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& co
         }
       }
       cv::putText(displayLeft, "LEFT | " + strobeStatusStr, cv::Point(20, 35),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.65, strobeOn ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255), 2);
+                  cv::FONT_HERSHEY_SIMPLEX, 0.65, (strobeStatusStr.find("OFF") == std::string::npos) ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255), 2);
       cv::putText(displayLeft, expStr + " | Thresh: " + std::to_string(activeThreshold), cv::Point(20, 65),
                   cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(255, 255, 0), 2);
     }
@@ -470,17 +473,35 @@ void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& co
     int key = cv::waitKey(1);
     if (key == 27 || key == 'q' || key == 'Q') {
       break;
+    } else if (key == 'h' || key == 'H') {
+      std::cout << "[IR Strobe Debugger] Activating 300 Hz Strobe Mode ('H')..." << std::endl;
+      if (serial.isOpen()) {
+          serial.writeChar('H');
+          strobeStatusStr = "STROBE: 300 Hz READY";
+      } else {
+          std::cout << "[IR Strobe Debugger] Serial not connected." << std::endl;
+      }
+    } else if (key == 'l' || key == 'L') {
+      std::cout << "[IR Strobe Debugger] Activating 10 Hz Standby Protection Mode ('L')..." << std::endl;
+      if (serial.isOpen()) {
+          serial.writeChar('L');
+          strobeStatusStr = "STROBE: 10 Hz STANDBY";
+      } else {
+          std::cout << "[IR Strobe Debugger] Serial not connected." << std::endl;
+      }
     } else if (key == '1') {
       std::cout << "[IR Strobe Debugger] Turning IR Illumination CONTINUOUSLY ON ('1')..." << std::endl;
       if (serial.isOpen()) {
-          serial.writeString("1");
+          serial.writeChar('1');
+          strobeStatusStr = "STROBE: DC ON (Aiming)";
       } else {
           std::cout << "[IR Strobe Debugger] Serial not connected." << std::endl;
       }
     } else if (key == '0') {
       std::cout << "[IR Strobe Debugger] Turning IR Illumination OFF ('0')..." << std::endl;
       if (serial.isOpen()) {
-          serial.writeString("0");
+          serial.writeChar('0');
+          strobeStatusStr = "STROBE: OFF";
       } else {
           std::cout << "[IR Strobe Debugger] Serial not connected." << std::endl;
       }
@@ -493,9 +514,9 @@ void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& co
     } else if (key == 9 || key == 'v' || key == 'V') {
       currentMode = (currentMode + 1) % 5;
     } else if (key == 's' || key == 'S' || key == 'f' || key == 'F') {
-      std::cout << "[IR Strobe Debugger] Sending 300ms IR Strobe Burst ('F')..." << std::endl;
+      std::cout << "[IR Strobe Debugger] Sending Single 300 Hz Test Burst ('F')..." << std::endl;
       if (serial.isOpen()) {
-          serial.writeString("F");
+          serial.writeChar('F');
       } else {
           std::cout << "[IR Strobe Debugger] Serial not connected." << std::endl;
       }

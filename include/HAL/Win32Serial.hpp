@@ -21,6 +21,8 @@ public:
     bool open(const std::string& portName, int baudRate = 115200);
     void close();
     bool writeString(const std::string& data);
+    bool writeChar(char c);
+    void flush();
     bool isOpen() const noexcept { return hSerial_ != INVALID_HANDLE_VALUE; }
 };
 #endif
