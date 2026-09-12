@@ -2,8 +2,10 @@
 #include "Diagnostics/IDiagnosticProvider.hpp"
 #include "Math/ITriggerDetector.hpp"
 #include "Math/StereoTriangulator.hpp"
+#include "Math/EmitterPowerMode.hpp"
 
 #include <Eigen/Core>
+#include <chrono>
 #include <cstdint>
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
@@ -100,6 +102,12 @@ private:
 
   int searchingLogCounter_;
 
+  // Standby emitter protection tracking
+  EmitterPowerMode emitterMode_ = EmitterPowerMode::HIGH_STROBE_READY;
+  double ballLossTimeoutSec_ = 5.0;
+  std::chrono::steady_clock::time_point emptyStartTime_;
+  bool hasEmptyStartTime_ = false;
+
 public:
   StereoBallTrackerTrigger(StereoCalibration calib = StereoCalibration(),
                            cv::Rect searchRoiLeft = cv::Rect(350, 440, 600, 310),
@@ -118,6 +126,10 @@ public:
 
   StereoTriggerState getState() const { return state_; }
   Eigen::Vector3d getLastKnown3DPosition() const { return lastKnown3DPos_; }
+
+  EmitterPowerMode getEmitterMode() const noexcept { return emitterMode_; }
+  bool isStandbyRequested() const noexcept { return emitterMode_ == EmitterPowerMode::LOW_STANDBY; }
+  void setLossTimeoutSec(double sec) noexcept { ballLossTimeoutSec_ = sec; }
 
   nlohmann::json getLatestDiagnostics() const override { return latestDiag_; }
 };

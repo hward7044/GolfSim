@@ -9,6 +9,7 @@
 #include "Diagnostics/FlightRecorder.hpp"
 #include "Orchestration/SessionStateMachine.hpp"
 #include "Orchestration/PipelineTimingConfig.hpp"
+#include "HAL/SerialPort.hpp"
 #include <Eigen/Geometry>
 #include <opencv2/imgproc.hpp>
 #include <spdlog/spdlog.h>
@@ -531,7 +532,25 @@ void testStereoBallTrackerTrigger() {
     assert(trigImpact2);
     assert(trigger.getState() == StereoTriggerState::CAPTURED);
 
-    spdlog::info("[TEST] StereoBallTrackerTrigger verification passed.");
+    // 6. Test STANDBY EMITTER PROTECTION (Dynamic Photobiological Safety)
+    trigger.reset();
+    assert(trigger.getEmitterMode() == EmitterPowerMode::HIGH_STROBE_READY);
+    assert(!trigger.isStandbyRequested());
+
+    // Set fast test timeout (50ms)
+    trigger.setLossTimeoutSec(0.05);
+    trigger.checkTrigger(blankFrameR, blankFrameR); // Starts empty timer
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    trigger.checkTrigger(blankFrameR, blankFrameR); // Triggers transition to LOW_STANDBY
+    assert(trigger.getEmitterMode() == EmitterPowerMode::LOW_STANDBY);
+    assert(trigger.isStandbyRequested());
+
+    // Placing ball back on tee restores HIGH_STROBE_READY
+    trigger.checkTrigger(frameL, frameR);
+    assert(trigger.getEmitterMode() == EmitterPowerMode::HIGH_STROBE_READY);
+    assert(!trigger.isStandbyRequested());
+
+    spdlog::info("[TEST] StereoBallTrackerTrigger verification passed (including dynamic emitter protection).");
 }
 
 void testAtomicRingBufferOverwrite() {
@@ -878,6 +897,30 @@ void testSessionStateMachineStroboscopicTiming() {
     spdlog::info("[TEST] SessionStateMachine stroboscopic timing and 3.0 ft geometry verification passed.");
 }
 
+void testSerialPort() {
+    SerialPort serial;
+    assert(!serial.isOpen());
+
+    // Test retry connection failure on non-existent port (2 retries = 3 total attempts)
+    // Use short delay (20 ms) to keep unit test runtime snappy (<100 ms total)
+#ifdef _WIN32
+    std::string fakePort = "COM99";
+#else
+    std::string fakePort = "/dev/tty_nonexistent_golfsim_test";
+#endif
+    bool success = serial.openWithRetry(fakePort, 115200, 2, 20);
+    assert(!success);
+    assert(!serial.isOpen());
+
+    // Operations on unopened/failed port must fail gracefully without throwing or crashing
+    assert(!serial.writeChar('H'));
+    assert(!serial.writeString("TEST"));
+    serial.flush();
+    serial.close();
+
+    spdlog::info("[TEST] SerialPort retry resilience and graceful degradation passed.");
+}
+
 void runMathTests() {
     spdlog::info("============================================");
     spdlog::info("Starting C++ Math Verification Tests...");
@@ -893,6 +936,7 @@ void runMathTests() {
     testAtomicRingBufferOverwrite();
     testAsyncFlightRecorderStream();
     testSessionStateMachineStroboscopicTiming();
+    testSerialPort();
 
     spdlog::info("============================================");
     spdlog::info("All C++ Math Verification Tests PASSED!");

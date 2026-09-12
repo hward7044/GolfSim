@@ -22,6 +22,7 @@
 #include "Diagnostics/GlobalLogger.hpp"
 #include "Diagnostics/LogLevel.hpp"
 #include "HAL/IUsbVideoDriver.hpp"
+#include "HAL/SerialPort.hpp"
 #ifdef _WIN32
 #include "HAL/MediaFoundationDriver.hpp"
 #include "HAL/Win32Serial.hpp"
@@ -52,7 +53,11 @@
 #include <sstream>
 
 const bool RUN_DEBUG_VIEWER = false;
+#ifdef _WIN32
 void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& comPort = "COM3");
+#else
+void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& comPort = "/dev/ttyACM0");
+#endif
 
 void runReplayViewer(const std::string &replayDir);
 
@@ -61,7 +66,11 @@ int main(int argc, char *argv[]) {
   int streamFrames = 50;
   int leftCamIdx = 1;
   int rightCamIdx = 0;
+#ifdef _WIN32
   std::string comPort = "COM3";
+#else
+  std::string comPort = "/dev/ttyACM0";
+#endif
 
   bool liveMode = false;
 
@@ -248,13 +257,27 @@ int main(int argc, char *argv[]) {
   PipelineTimingConfig timingConfig;
   timingConfig.workingDistanceMeters = 0.9144; // 3.0 ft
   timingConfig.nominalBallRadiusPx   = 23.3;   // ~23.3 px radius at 3.0 ft
-  timingConfig.pulseIntervalMs       = 1.0;    // 1.0 ms strobe spacing
   timingConfig.minPointsToSolve      = 3;      // Minimum 3 points
   timingConfig.maxFramesPerShot      = 2;      // 2 frames maximum for irons/wedges
   timingConfig.emptyFrameTimeout     = 1;      // Solve immediately on 1st empty frame
 
   auto stateMachine = std::make_shared<ConcreteSSM>(trigger, vision, spatial,
                                                     kinematics, network, timingConfig);
+
+  // Initialize Serial connection to Arduino Strobe Controller (with 2 retries before graceful degradation)
+  SerialPort serial;
+  if (serial.openWithRetry(comPort, 115200, 2, 500)) {
+    spdlog::info("[System] Connected to IR Strobe Controller on {}", comPort);
+  } else {
+    spdlog::warn("[System] Could not connect to IR Strobe Controller on {}. Running in offline/simulation mode.", comPort);
+  }
+
+  // Connect serial callback from SessionStateMachine
+  stateMachine->setSerialCallback([&serial](char cmd) {
+    if (serial.isOpen()) {
+      serial.writeChar(cmd);
+    }
+  });
 
   if (streamMode) {
     spdlog::info("[System] Stream Recording Mode Enabled! Chunk size: {} frames", streamFrames);
@@ -275,6 +298,13 @@ int main(int argc, char *argv[]) {
 
   spdlog::info("[System] Shutting down threads...");
   threadManager->stop();
+
+  if (serial.isOpen()) {
+    spdlog::info("[System] Powering off IR emitters ('0')...");
+    serial.writeChar('0');
+    serial.close();
+  }
+
   spdlog::info("[System] Shutdown completed cleanly.");
   return 0;
 }
@@ -291,8 +321,8 @@ void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& co
   std::cout << "Starting Live Camera & IR Strobe Debug Viewer" << std::endl;
   std::cout << "============================================" << std::endl;
 
-  Win32Serial serial;
-  if (serial.open(comPort, 115200)) {
+  SerialPort serial;
+  if (serial.openWithRetry(comPort, 115200, 2, 500)) {
       std::cout << "Successfully connected to Arduino on " << comPort << std::endl;
   } else {
       std::cerr << "Warning: Could not open Serial port " << comPort << ". Hardware strobe testing disabled." << std::endl;
@@ -527,6 +557,11 @@ void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& co
       activeThreshold = (std::max)(10, activeThreshold - 5);
       std::cout << "[IR Strobe Debugger] Threshold set to: " << activeThreshold << std::endl;
     }
+  }
+
+  if (serial.isOpen()) {
+    serial.writeChar('0');
+    serial.close();
   }
 
   cv::destroyAllWindows();

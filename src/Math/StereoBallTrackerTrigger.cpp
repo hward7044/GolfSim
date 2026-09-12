@@ -264,6 +264,10 @@ bool StereoBallTrackerTrigger::checkTrigger(const cv::Mat &leftFrame,
     }
 
     if (bestL != nullptr && bestR != nullptr) {
+      // Ball candidate detected -> restore High Strobe Ready
+      hasEmptyStartTime_ = false;
+      emitterMode_ = EmitterPowerMode::HIGH_STROBE_READY;
+
       // Check 3D positional stability across consecutive frames before locking
       double posShiftMeters = (best3D - lastSearchCandidate3D_).norm();
       if (searchStabilityCounter_ > 0 &&
@@ -284,6 +288,9 @@ bool StereoBallTrackerTrigger::checkTrigger(const cv::Mat &leftFrame,
         searchingLogCounter_ = 0;
 
         state_ = StereoTriggerState::ARMED;
+        emitterMode_ = EmitterPowerMode::HIGH_STROBE_READY;
+        hasEmptyStartTime_ = false;
+
         double distFeet = bestPairDist3D * 3.28084;
         double distMm = bestPairDist3D * 1000.0;
         spdlog::info(
@@ -297,6 +304,20 @@ bool StereoBallTrackerTrigger::checkTrigger(const cv::Mat &leftFrame,
     } else {
       searchStabilityCounter_ = 0;
       searchingLogCounter_++;
+
+      // Inactivity standby timer
+      if (!hasEmptyStartTime_) {
+        emptyStartTime_ = std::chrono::steady_clock::now();
+        hasEmptyStartTime_ = true;
+      } else {
+        auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - emptyStartTime_).count();
+        if (elapsed >= ballLossTimeoutSec_ && emitterMode_ != EmitterPowerMode::LOW_STANDBY) {
+          emitterMode_ = EmitterPowerMode::LOW_STANDBY;
+          spdlog::info("[StereoTrigger] Tee unoccupied for {:.1f}s >= {:.1f}s threshold. Entering LOW_STANDBY emitter protection.",
+                       elapsed, ballLossTimeoutSec_);
+        }
+      }
+
       if (searchingLogCounter_ % 60 == 1) {
         spdlog::info(
             "[StereoTrigger] Searching... Candidates found: Left={}, Right={}. "
@@ -310,6 +331,7 @@ bool StereoBallTrackerTrigger::checkTrigger(const cv::Mat &leftFrame,
     latestDiag_ = {
         {"state", "SEARCHING"},
         {"triggered", false},
+        {"emitterMode", (emitterMode_ == EmitterPowerMode::HIGH_STROBE_READY ? "READY" : "STANDBY")},
         {"leftCandidates", leftCandidates.size()},
         {"rightCandidates", rightCandidates.size()},
         {"searchStabilityCounter", searchStabilityCounter_},
@@ -523,10 +545,14 @@ void StereoBallTrackerTrigger::reset() {
   searchStabilityCounter_ = 0;
   lastSearchCandidate3D_ = Eigen::Vector3d(0.0, 0.0, 0.0);
 
+  emitterMode_ = EmitterPowerMode::HIGH_STROBE_READY;
+  hasEmptyStartTime_ = false;
+
   spdlog::info("[StereoTrigger] State reset: SEARCHING for ball...");
 
   latestDiag_ = {{"state", "SEARCHING"},
                  {"triggered", false},
+                 {"emitterMode", "READY"},
                  {"graceCounter", 0},
                  {"searchStabilityCounter", 0},
                  {"lastKnown3D", {0.0, 0.0, 0.0}}};

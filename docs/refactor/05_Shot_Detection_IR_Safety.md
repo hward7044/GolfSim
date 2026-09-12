@@ -1,6 +1,6 @@
 # Refactor 05: Shot Detection & Photobiological IR Eye Safety
 
-This document details the photobiological safety standards, mathematical irradiance calculations, optical risk group classifications, and concrete firmware fail-safes for the 850nm Near-Infrared (NIR) stroboscopic system at the **2.0-foot (0.61m)** working distance.
+This document details the photobiological safety standards, mathematical irradiance calculations, optical risk group classifications, and concrete firmware fail-safes for the 850nm Near-Infrared (NIR) stroboscopic system at the **3.0-foot (0.9144m / 914.4mm)** working distance.
 
 ---
 
@@ -99,5 +99,30 @@ Software running on a PC can freeze, crash, or enter an infinite loop with the s
 ### 4.2 Inactivity Standby & Thermal Protection
 - If no serial keep-alive or ball lock update is received from the PC, the firmware defaults to safe low-frequency operation.
 - Maximum continuous on-time is capped in hardware to ensure the emitter duty cycle cannot exceed $1.0\%$ under any failure mode.
+
+---
+
+## 5. Cross-Platform Serial Communication & Reconnection Strategy
+
+Communication between the host application and the Arduino Strobe Controller is managed via `SerialPort` (`include/HAL/SerialPort.hpp` and `src/HAL/SerialPort.cpp`):
+- **Linux**: Direct POSIX `termios` configuration on `/dev/ttyACM0` (or `/dev/ttyUSB0`) with non-blocking raw serial, 8N1 framing, and `B115200`.
+- **Windows**: Win32 `CreateFile` / `SetCommState` on `COM3` (or user-specified port).
+- **2-Retry Reconnection Strategy**:
+  When opening the port via `serial.openWithRetry(port, baud, maxRetries=2, delayMs=500)`:
+  1. Attempt initial connection.
+  2. If unsuccessful, retry up to 2 times (3 attempts total) with a 500 ms backoff.
+  3. If all attempts fail, log a warning and degrade gracefully to headless/offline simulation mode without crashing or throwing.
+- **Graceful Shutdown**: Upon normal program exit, SIGINT, or pipeline teardown, the system dispatches command `'0'` over serial to explicitly turn off all emitters before closing the port descriptor.
+
+---
+
+## 6. Dynamic Emitter Power Mode & Trigger Parity
+
+Both trigger implementations (`StereoBallTrackerTrigger` and `BallPresenceTrigger`) share the standardized `EmitterPowerMode` enum (`include/Math/EmitterPowerMode.hpp`):
+- `EmitterPowerMode::HIGH_STROBE_READY`: Active 300 Hz stroboscopic illumination while a ball is placed at address or detected on the tee. Dispatches `'H'` over USB serial.
+- `EmitterPowerMode::LOW_STANDBY`: Inactive 10 Hz illumination when no ball is present after `ballLossTimeoutSec` (default 5.0 seconds). Dispatches `'L'` over USB serial.
+- **Automatic Wake-up**: As soon as a candidate ball is placed on the tee, the trigger immediately restores `HIGH_STROBE_READY` on the very first detection frame so that full temporal illumination is active to acquire the stable 5-frame lock.
+- **Deduplication**: `SessionStateMachine` tracks the last dispatched command and only transmits over serial when the requested power mode actually transitions, eliminating USB bus chatter during continuous frame processing.
+
 
 

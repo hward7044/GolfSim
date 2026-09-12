@@ -11,6 +11,7 @@
 #include <vector>
 #include <fstream>
 #include <chrono>
+#include <functional>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -77,6 +78,16 @@ private:
     int            streamFrameLimit = 50;
     std::vector<RecordedFrame> streamFramesPool;
     size_t         streamFrameCount = 0;
+
+    std::function<void(char)> onSerialCommand_ = nullptr;
+    char           lastCommandSent_ = 0;
+
+    void sendSerialCommand(char cmd) {
+        if (onSerialCommand_ && cmd != lastCommandSent_) {
+            onSerialCommand_(cmd);
+            lastCommandSent_ = cmd;
+        }
+    }
 
     template<typename T>
     nlohmann::json getTelemetry(const T& obj) {
@@ -149,6 +160,10 @@ public:
                      enable ? "ENABLED" : "DISABLED", frameLimit);
     }
 
+    void setSerialCallback(std::function<void(char)> cb) {
+        onSerialCommand_ = std::move(cb);
+    }
+
     void processNextFrame(const FrameSet& set) {
         cv::Mat leftFrame = set.getFrame(CameraRole::STEREO_LEFT);
         cv::Mat rightFrame = set.getFrame(CameraRole::STEREO_RIGHT);
@@ -160,22 +175,16 @@ public:
         nlohmann::json trigDiag;
 
         // If in stream recording mode, buffer frames and write stream chunks to disk without waiting for a shot trigger
+        // Stream recording mode bypasses shot state machine
         if (streamRecordingMode) {
-            trigger.checkTrigger(leftFrame, rightFrame);
-            trigDiag = getTelemetry(trigger);
-
             if (streamFrameCount < streamFramesPool.size()) {
-                auto& rf = streamFramesPool[streamFrameCount];
+                auto& rf = streamFramesPool[streamFrameCount++];
                 rf.timestamp = set.timestamp;
                 leftFrame.copyTo(rf.leftFrame);
                 rightFrame.copyTo(rf.rightFrame);
-                rf.triggerDiag = trigDiag;
-                streamFrameCount++;
             }
 
-            if (streamFrameCount >= static_cast<size_t>(streamFrameLimit)) {
-                spdlog::info("[SessionStateMachine] Stream chunk captured ({}/{} frames). Saving to disk...",
-                             streamFrameCount, streamFrameLimit);
+            if (streamFrameCount >= streamFrameLimit) {
                 std::vector<RecordedFrame> streamFrames(streamFramesPool.begin(), streamFramesPool.begin() + streamFrameCount);
                 recorder.saveStreamSession(streamFrames);
                 streamFrameCount = 0;
@@ -193,6 +202,15 @@ public:
                 shotFrameCount = 0;
                 trigDiag = getTelemetry(trigger);
                 spdlog::info("[SessionStateMachine] Impact trigger confirmed! Starting shot capture...");
+                sendSerialCommand('H');
+            } else {
+                if constexpr (requires { trigger.isStandbyRequested(); }) {
+                    if (trigger.isStandbyRequested()) {
+                        sendSerialCommand('L');
+                    } else {
+                        sendSerialCommand('H');
+                    }
+                }
             }
         }
 

@@ -11,10 +11,7 @@ enum class TriggerState {
     BALL_DEPARTED
 };
 
-enum class EmitterPowerMode {
-    HIGH_STROBE_READY, // 300 Hz stroboscopic mode
-    LOW_STANDBY        // 10 Hz standby emitter protection mode
-};
+#include "Math/EmitterPowerMode.hpp"
 
 class BallPresenceTrigger : public ITriggerDetector, public IDiagnosticProvider {
 private:
