@@ -52,73 +52,75 @@ $$D_{\text{px}} \approx 1000 \times \frac{0.04267\text{ m}}{0.9144\text{ m}} \ap
    - Strobe pulsing is driven independently by the **Arduino microcontroller (ATmega328P)** switching a logic-level MOSFET connected to the 850nm IR LED bank.
 
 ### 2.2 Kinematic Timing Guide Across Shot Speeds (at 3.0 ft / 90 cm FOV)
+Under continuous $300\text{ Hz}$ strobing ($\Delta t = 3.333\text{ ms}$, 3 pulses per 10ms exposure):
 
-| Club / Shot Class | Ball Speed (mph) | Ball Speed (m/s) | Travel per 1.0ms Pulse | Travel in 10ms Frame | Time across 0.90m FOV | Frames in FOV | Solve & Capture Behavior |
+| Club / Shot Class | Ball Speed (mph) | Ball Speed (m/s) | Travel per 3.33ms Pulse | Travel in 10ms Frame | Time across 0.90m FOV | Frames in FOV | Solve & Capture Behavior |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Putt / Chip** | 15 mph | $6.7\text{ m/s}$ | $6.7\text{ mm}$ | $6.7\text{ cm}$ | **134 ms** | **13 frames** | Slow movement; solves after `maxFramesPerShot = 2` (10 pulses across 13.4 cm). |
-| **Sand / Lob Wedge** | 50 mph | $22.4\text{ m/s}$ | $22.4\text{ mm}$ | $22.4\text{ cm}$ | **40.2 ms** | **4 frames** | Frame 1: 5 pulses (22.4 cm). Frame 2: 5 pulses (44.8 cm). Solves after Frame 2 across 10 pulses. |
-| **PW / 9-Iron** | 80 mph | $35.8\text{ m/s}$ | $35.8\text{ mm}$ | $35.8\text{ cm}$ | **25.1 ms** | **2–3 frames** | Frame 1: 5 pulses (35.8 cm). Frame 2: 5 pulses (71.6 cm). Solves immediately after Frame 2 across 72 cm baseline. |
-| **6-Iron / 7-Iron** | 105 mph | $46.9\text{ m/s}$ | $46.9\text{ mm}$ | $46.9\text{ cm}$ | **19.2 ms** | **2 frames** | Complete pulse separation ($46.9\text{ mm} > 42.7\text{ mm}$ ball dia). Solves after Frame 2. |
-| **3-Wood / Driver** | 160 mph | $71.5\text{ m/s}$ | $71.5\text{ mm}$ | $71.5\text{ cm}$ | **12.6 ms** | **1–2 frames** | Ball travels 71.5 cm in Frame 1 and exits during Frame 2. Solves immediately on Frame 2 empty frame (<15 ms latency). |
+| **Putt / Chip** | 15 mph | $6.7\text{ m/s}$ | $2.2\text{ cm}$ | $6.7\text{ cm}$ | **134 ms** | **13 frames** | Slow movement; solves after `maxFramesPerShot = 2` (6 pulses across 13.4 cm). |
+| **Sand / Lob Wedge** | 50 mph | $22.4\text{ m/s}$ | $7.5\text{ cm}$ | $22.4\text{ cm}$ | **40.2 ms** | **4 frames** | Frame 1: 3 pulses (22.4 cm). Frame 2: 3 pulses (44.8 cm). Solves after Frame 2 across 6 pulses. |
+| **PW / 9-Iron** | 80 mph | $35.8\text{ m/s}$ | $11.9\text{ cm}$ | $35.8\text{ cm}$ | **25.1 ms** | **2–3 frames** | Frame 1: 3 pulses (35.8 cm). Frame 2: 3 pulses (71.6 cm). Completely clean silhouette separation ($11.9\text{ cm} > 4.3\text{ cm}$). |
+| **6-Iron / 7-Iron** | 105 mph | $46.9\text{ m/s}$ | $15.6\text{ cm}$ | $46.9\text{ cm}$ | **19.2 ms** | **2 frames** | Complete pulse separation. Solves after Frame 2 across 70+ cm baseline. |
+| **3-Wood / Driver** | 160 mph | $71.5\text{ m/s}$ | $23.8\text{ cm}$ | $71.5\text{ cm}$ | **12.6 ms** | **1–2 frames** | Ball travels 71.5 cm in Frame 1 (3 pulses) and exits during Frame 2. Solves immediately on Frame 2 empty frame (<15 ms latency). |
 
 ---
 
-## 3. Pulse Spacing & Aliasing Math
+## 3. Pulse Spacing & Spatial Separation Math
 
 To determine the strobe pulse interval $\Delta t$, we balance two physical constraints:
-1. **Rotational Aliasing Boundary**: Rotation between pulses must be $< 90^\circ$ (ideally $< 45^\circ\text{–}60^\circ$) so Procrustes SVD can uniquely track retroreflective marker dots without ambiguous $360^\circ$ wrap-around.
-2. **Blob Spatial Separation**: Consecutive ball silhouettes should ideally not overlap too heavily ($> 50\%$).
+1. **Blob Spatial Separation**: Consecutive ball silhouettes should not overlap so moments contour analysis extracts crisp individual centroids.
+2. **Exposure Budget**: $N$ sub-pulses must comfortably fit within the camera's $10.0\text{ ms}$ global shutter exposure.
 
-### 3.1 Spin Aliasing Constraint
-For high-spin wedge shots: $\text{Spin} \approx 9,000\text{ RPM} = 150\text{ rev/s} = 300\pi\text{ rad/s} \approx 942.5\text{ rad/s}$.
-Angular rotation $\Delta \theta = \omega \cdot \Delta t$:
-- At $\Delta t = 1.0\text{ ms}$: $\Delta \theta = 942.5 \times 0.0010 = 0.94\text{ rad} \approx \mathbf{54.0^\circ}$ (ideal margin, well under $90^\circ$).
-- At $\Delta t = 0.8\text{ ms}$: $\Delta \theta = 942.5 \times 0.0008 = 0.75\text{ rad} \approx \mathbf{43.2^\circ}$.
-
-### 3.2 Spatial Separation Constraint
+### 3.1 Spatial Separation at 300 Hz ($\Delta t = 3.333\text{ ms}$)
 At 80 mph ($35.8\text{ m/s}$):
-- Travel per $\Delta t = 1.0\text{ ms}$: $\Delta x = 35.8 \times 0.001 = 0.0358\text{ m} = \mathbf{35.8\text{ mm}}$.
-- Since ball diameter is $42.7\text{ mm}$, centers are $35.8\text{ mm}$ apart $\implies$ silhouettes slightly overlap by $6.9\text{ mm}$ (~16%).
-- At 105 mph ($46.9\text{ m/s}$): $\Delta x = 46.9\text{ mm} > 42.7\text{ mm}$, completely clear separation!
+- Travel per $\Delta t = 3.333\text{ ms}$: $\Delta x = 35.8 \times 0.00333 = \mathbf{119.3\text{ mm} \quad (\approx 11.9\text{ cm})}$.
+- Since ball diameter is $42.67\text{ mm}$, centers are $119.3\text{ mm}$ apart $\implies$ **silhouettes are separated by $76.6\text{ mm}$ with zero overlap!**
+- Even for chip shots down to 30 mph ($13.4\text{ m/s}$), travel is $44.7\text{ mm} > 42.7\text{ mm}$, maintaining clean silhouette separation without blob blending.
 
-### 3.3 Recommended Strobe Profile for 3.0 ft Setup
-- **Number of Sub-pulses $N$**: 5 pulses per frame.
-- **Pulse Interval $\Delta t$**: $1.0\text{ ms}$ (total pulse train duration = $4.0\text{ ms}$, easily fitting inside the 10.0 ms exposure window).
+### 3.2 Final Production Strobe Profile (Implemented)
+- **Active Frequency**: $300\text{ Hz}$ continuous strobing when ball is locked at address.
+- **Pulse Interval $\Delta t$**: $3.3333\text{ ms}$ ($3,333\ \mu\text{s}$).
+- **Pulses per Frame**: 3 pulses during each $10.0\text{ ms}$ exposure window.
 - **Sub-pulse Flash Duration**: $30\text{ \mu s}$ (freezes motion blur at 100 mph to under $1.4\text{ mm}$ / 1.5 pixels).
+- **Standby Frequency**: $10\text{ Hz}$ when tee is empty (drops optical power to $< 0.03\%$ duty cycle).
 
 ---
 
 ## 4. 1-to-2 Frame Hybrid Architecture
 
 ```
-Shot Impact ──> [Frame 1 Capture (10ms exposure)] ──> Contains 5 pulses (0 to 36 cm)
-                                                            │
-                                  ┌─────────────────────────┴─────────────────────────┐
-                                  ▼                                                   ▼
-                    If ball exits FOV during Frame 1               If ball still in FOV (Irons / Wedges)
-                    (High Speed Shot):                             (Moderate / Slow Shot):
-                    • Solve kinematics immediately                 • Capture Frame 2 (next 10ms)
-                    • Transmit TCP payload in <15ms                • Append Frame 2 pulses (36 to 72 cm)
-                                                                   • Solve across 10 pulses with 72cm baseline!
+Continuous 300 Hz Strobing
+          │
+Impact Departure ──> [Frame 1 Capture (10ms exposure)] ──> Contains 3 pulses (0 to 36 cm)
+                                                                 │
+                                ┌────────────────────────────────┴────────────────────────────────┐
+                                ▼                                                                 ▼
+                  If ball exits FOV during Frame 1                              If ball still in FOV (Irons / Wedges)
+                  (High Speed Shot):                                            (Moderate / Slow Shot):
+                  • Solve kinematics immediately                                • Capture Frame 2 (next 10ms)
+                  • Transmit TCP payload in <15ms                               • Append Frame 2 pulses (36 to 72 cm)
+                                                                                • Solve across up to 6 pulses with 72cm baseline!
 ```
 
 ### 4.1 Eliminating the Artificial 15-Frame Latency Bug
-In the existing `SessionStateMachine.hpp`, the state machine had:
-```cpp
-if (emptyFrameCount >= 15 || trajectoryBuffer.size() >= 25)
-```
-Waiting 15 empty frames at 30–100 FPS forced the system to wait **150 to 500 ms** before computing and transmitting shot data.
+In the legacy `SessionStateMachine.hpp`, the state machine waited for 15 empty frames before solving (`if (emptyFrameCount >= 15)`), adding an unacceptable 150–500 ms delay.
+The refactored state machine uses `emptyFrameTimeout = 1` from `PipelineTimingConfig`, solving immediately upon the first empty frame following ball departure.
 
 ### 4.2 Central Configuration Structure (`PipelineTimingConfig`)
+Implemented in [include/Orchestration/PipelineTimingConfig.hpp](file:///home/hward/Projects/GolfSim/include/Orchestration/PipelineTimingConfig.hpp):
 
 ```cpp
 struct PipelineTimingConfig {
     double workingDistanceMeters = 0.9144; // 3.0 ft (914.4 mm)
-    double pulseIntervalMs       = 1.0;    // 1.0 ms strobe spacing
-    int    minPointsToSolve      = 3;      // Minimum pulses required to solve (default: 3)
+    double pulseIntervalMs       = 3.3333; // 300 Hz continuous strobing spacing
+    int    minPointsToSolve      = 3;      // Minimum pulses required to solve
     int    maxFramesPerShot      = 2;      // Cap at 2 frames maximum for irons/wedges
     int    emptyFrameTimeout     = 1;      // Solve immediately on 1st empty frame after pulses
     double subPulseDurationUs    = 30.0;   // 30 us LED strobe flash duration
     double nominalBallRadiusPx   = 23.3;   // ~23.3 px radius at 3.0 ft working distance
+    double highStrobeRateHz      = 300.0;  // Continuous active rate
+    double standbyStrobeRateHz   = 10.0;   // Inactivity standby protection rate
+    int    cameraExposureUs      = 10000;  // 10.0 ms camera exposure window
+    int    strobePulseCount      = 3;      // 3 pulses per 10ms exposure
+    double ballLossTimeoutSec    = 5.0;    // 5.0s empty tee timeout to standby
 };
 ```

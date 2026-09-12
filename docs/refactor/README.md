@@ -4,17 +4,17 @@ This directory contains the detailed engineering specifications, mathematical pr
 
 ---
 
-## Refactor Modules
+## Refactor Modules & Implementation Status
 
-| Module | Title | Key Topics Covered |
-| :--- | :--- | :--- |
-| **[01](01_RingBuffer_Concurrency.md)** | **Ring Buffer & Concurrency Safety** | Lock-free circular overwrite semantics, eliminating data races on full buffers, zero-allocation `cv::Mat` preservation (`pop_into`), cache-line alignment (`alignas(64)`), and non-blocking asynchronous `FlightRecorder` disk I/O. |
-| **[02](02_Stroboscopic_Flight_Geometry.md)** | **Stroboscopic Flight Geometry & Timing (2.0 ft Range)** | Kinematic timing at 2.0 ft distance for iron shots (50–120 mph), FOV coverage (84 cm), pulse spacing ($\Delta t = 0.8\text{–}1.2\text{ ms}$), 1-to-2 frame hybrid capture, and configurable state machine solve thresholds. |
-| **[03](03_Hardware_Trigger_Handshake.md)** | **Hardware Trigger Handshake & Latency Analysis** | Camera STROBE pin $\leftrightarrow$ Arduino D2 handshake, software arming protocol, rigorous USB serial latency jitter analysis (2–8ms OS lag vs 15ms ball flight), and low-latency mitigation architectures. |
-| **[04](04_Stereo_Math_Geometry.md)** | **Stereo Mathematics & Coordinate Transformations** | Mathematical correction of Right Camera ray-sphere origin ($O = -R^T T$) and ray direction ($R^T \cdot \text{rayCamR}$), preventing `ITriggerDetector` mutual recursion, and monotonic flight axis sorting. |
-| **[05](05_Shot_Detection_IR_Safety.md)** | **Shot Detection & Photobiological IR Eye Safety** | Optical eye safety under IEC 62471 / ANSI RP-27 (Exempt Group RG0), ultra-low duty cycle calculations ($0.0018\%$), two-tier illumination (dim pilot pulse in idle $\to$ armed burst on impact), and Arduino hardware watchdog timer clamps. |
-| **[06](06_Architecture_Modularity.md)** | **Architecture Modularity & Application Decoupling** | Strategy for modularizing `main.cpp` (deferred to Phase 5), extracting `ReplayViewer` and `CameraDebugger`, centralized `AppConfig`, and headless `PlaybackCameraNode` for offline simulation. |
-| **[07](07_Test_Infrastructure.md)** | **Testing Infrastructure & CTest Integration** | Standalone test runner (`GolfSimTests`), CTest integration, replacing C `assert()` with release-safe assertions (`TEST_ASSERT`), and removing test delays from production startup. |
+| Module | Title | Status | Key Topics & Final Design Decisions |
+| :--- | :--- | :---: | :--- |
+| **[01](01_RingBuffer_Concurrency.md)** | **Ring Buffer & Concurrency Safety** | **COMPLETED** | Lock-free circular overwrite semantics (`push_overwrite`), zero-allocation frame reuse (`pop_into`), cache-line alignment (`alignas(64)`), and non-blocking background queue for `FlightRecorder` disk writes. |
+| **[02](02_Stroboscopic_Flight_Geometry.md)** | **Stroboscopic Flight Geometry & Timing (3.0 ft Range)** | **COMPLETED** | Kinematic timing at 3.0 ft distance (914.4 mm), 10 ms exposure capturing 3 pulses at 300 Hz ($\Delta t = 3.33\text{ ms}$), 1-to-2 frame hybrid capture, and centralized `PipelineTimingConfig`. |
+| **[03](03_Hardware_Trigger_Handshake.md)** | **Hardware Trigger Handshake & Latency Analysis** | **COMPLETED** | Analysis showed 19–24 ms OS USB lag makes reactive impact triggering impossible at close range. **Decision**: Implemented **Continuous Low-Power Strobing** (Strategy B) with dual rates (300 Hz active / 10 Hz standby), eliminating USB trigger latency entirely. |
+| **[04](04_Stereo_Math_Geometry.md)** | **Stereo Mathematics & Coordinate Transformations** | **COMPLETED** | Mathematical correction of Right Camera ray-sphere origin ($\mathbf{O}_R = -R^T T$) and ray direction ($R^T \cdot \mathbf{d}_R$), precomputed cached extrinsics, elimination of mutual recursion in `ITriggerDetector`, and $2 \times 2$ covariance principal motion vector trajectory sorting. |
+| **[05](05_Shot_Detection_IR_Safety.md)** | **Shot Detection & Photobiological IR Eye Safety** | **COMPLETED** | Optical eye safety under IEC 62471 / ANSI RP-27 (Exempt Group RG0). At 300 Hz continuous strobing ($30\mu\text{s}$ pulses), duty cycle is $0.9\%$ and average optical power is $54\text{ mW}$ (over $27\times$ lower than consumer baby monitors). Arduino Timer1 hardware $50\mu\text{s}$ clamp and automatic 5s standby fallback. |
+| **[06](06_Architecture_Modularity.md)** | **Architecture Modularity & Application Decoupling** | **PENDING** | Plan for modularizing `main.cpp`, extracting `ReplayViewer` and `CameraDebugger`, centralized `AppConfig`, and headless `PlaybackCameraNode` for offline simulation. |
+| **[07](07_Test_Infrastructure.md)** | **Testing Infrastructure & CTest Integration** | **PENDING** | Standalone test runner (`GolfSimTests`), CTest integration, replacing C `assert()` with release-safe assertions (`TEST_ASSERT`), and removing test delays from production startup. |
 
 ---
 
@@ -22,10 +22,17 @@ This directory contains the detailed engineering specifications, mathematical pr
 
 ```mermaid
 graph TD
-    Phase1[01: Ring Buffer & Concurrency] --> Phase2[04: Stereo Math & Geometry]
-    Phase2 --> Phase3[02 & 03: Flight Timing & Hardware Handshake]
-    Phase3 --> Phase4[05: Safe Detection & Firmware Watchdog]
-    Phase4 --> Phase5[07: Standalone Test Suite]
-    Phase5 --> Phase6[06: Modular Architecture & main.cpp Refactor]
+    Phase1["01: Ring Buffer & Concurrency (Done)"] --> Phase2["02 & 03: Flight Timing & Continuous Strobing (Done)"]
+    Phase2 --> Phase3["05: Safe Detection & Firmware Watchdog (Done)"]
+    Phase3 --> Phase4["04: Stereo Math & Principal Vector Sorting (Done)"]
+    Phase4 --> Phase5["07: Standalone Test Suite & CTest (Next)"]
+    Phase5 --> Phase6["06: Modular Architecture & main.cpp Refactor"]
+    
+    style Phase1 fill:#d4edda,stroke:#28a745,stroke-width:2px;
+    style Phase2 fill:#d4edda,stroke:#28a745,stroke-width:2px;
+    style Phase3 fill:#d4edda,stroke:#28a745,stroke-width:2px;
+    style Phase4 fill:#d4edda,stroke:#28a745,stroke-width:2px;
+    style Phase5 fill:#fff3cd,stroke:#ffc107,stroke-width:2px;
+    style Phase6 fill:#e2e3e5,stroke:#6c757d,stroke-width:1px;
 ```
 

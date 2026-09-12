@@ -91,3 +91,26 @@ For whatever serial messages are sent over USB:
 - **Win32Serial C++ Implementation**: Configure `COMMTIMEOUTS` with non-blocking write completion and use `PurgeComm(hSerial, PURGE_TXCLEAR)` to prevent OS buffer stacking.
 - **Linux**: Configure `termios` with `VMIN = 0, VTIME = 0` and use `ioctl(fd, TCFLSH, 2)`.
 
+---
+
+## 4. Final Architectural Decision & Implementation (Strategy B)
+
+### 4.1 Why Strategy B Was Selected
+Reactive microburst triggering over USB was abandoned because the 19–24 ms OS communication latency physically exceeds the 12–25 ms flight time of high-speed golf shots across the field of view.
+
+Instead, **Strategy B (Continuous Dual-Rate Strobing)** was implemented in commit `d9161ac`:
+- **When a ball is placed on the tee**: `BallPresenceTrigger` locks onto the ball after 5 stable frames and sends single-byte command `'H'` to the Arduino via USB serial.
+- **Continuous 300 Hz Strobing**: The Arduino continuously pulses the IR LED bank at $300\text{ Hz}$ ($30\mu\text{s}$ pulse every $3.333\text{ ms}$). Because the camera runs at 100 FPS with $10\text{ ms}$ exposure, every captured frame naturally contains 3 stroboscopic ball positions.
+- **Zero Trigger Latency**: When impact occurs, the ball's departure trajectory is already captured inside the current frame. The PC never needs to send a reactive trigger command at the instant of impact.
+- **Automatic Standby Fallback**: When the tee is empty for $> 5.0\text{ seconds}$ (`ballLossTimeoutSec`), the PC sends `'L'` to switch the Arduino to $10\text{ Hz}$ low-power standby for emitter protection.
+
+### 4.2 Serial Command Interface
+Implemented in [firmware/strobe_controller/strobe_controller.ino](file:///home/hward/Projects/GolfSim/firmware/strobe_controller/strobe_controller.ino):
+
+| Command Byte | Mode | Frequency | Pulse Duration | Purpose |
+| :---: | :--- | :--- | :--- | :--- |
+| `'H'` / `'h'` | `HIGH_STROBE_READY` | $300\text{ Hz}$ | $30\ \mu\text{s}$ | Active hitting mode when ball is addressed on the tee |
+| `'L'` / `'l'` | `LOW_STANDBY` | $10\text{ Hz}$ | $30\ \mu\text{s}$ | Emitter thermal protection and eye safety when tee is empty |
+| `'S'` / `'s'` | `OFF` | $0\text{ Hz}$ | $0\ \mu\text{s}$ | Complete emitter shutdown |
+
+

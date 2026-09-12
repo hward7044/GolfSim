@@ -66,12 +66,23 @@ Eigen::Vector3d O = T_eigen;                 // Bug: Used T (-0.1) instead of -R
 - The code placed the Right Camera at $X = -100\text{ mm}$ (100mm to the *left* of the left camera, 200mm away from where it physically sits!).
 - The code projected rays along $R \cdot \mathbf{d}_R$ instead of $R^T \cdot \mathbf{d}_R$.
 
-### 2.5 Correct Formulation
+### 2.5 Implemented Formulation & Extrinsics Cache
+Implemented in [src/Math/StereoTriangulator.cpp](file:///home/hward/Projects/GolfSim/src/Math/StereoTriangulator.cpp):
+
+Extrinsics are precomputed once during calibration update rather than per-marker in the hot loop:
 ```cpp
-// CORRECTED MATHEMATICS:
-Eigen::Matrix3d R_inv = R_eigen.transpose();
-Eigen::Vector3d O = -R_inv * T_eigen;          // Exact optical center (+100mm on X)
-Eigen::Vector3d rayDir = (R_inv * rayCamR).normalized(); // Exact ray in world frame
+void StereoTriangulator::updateExtrinsics() {
+    if (!calib_.R.empty() && !calib_.T.empty()) {
+        // ... matrix conversion ...
+        R_inv_ = R_eigen.transpose();
+        rightOpticalCenter_ = -R_inv_ * T_eigen; // Exact optical center (+100mm on X)
+    }
+}
+```
+During ray-sphere solving for unmatched right markers:
+```cpp
+Eigen::Vector3d rayDir = (R_inv_ * rayCamR).normalized(); // Exact ray in world frame
+Eigen::Vector3d O = rightOpticalCenter_;                  // Exact right camera position (+0.1m)
 ```
 
 ### 2.6 Quadratic Intersection Solution
@@ -87,23 +98,35 @@ $$\mathbf{P}_{\text{marker}} = \mathbf{O} + t \mathbf{d}$$
 
 ---
 
-## 3. Other Mathematical & Interface Fixes
+## 3. Mathematical & Interface Implementations
 
-### 3.1 Eliminating Mutual Recursion in `ITriggerDetector.hpp`
-[ITriggerDetector.hpp](file:///home/hward/Projects/GolfSim/include/Math/ITriggerDetector.hpp#L9-L17) currently defines:
+### 3.1 Mutual Recursion Elimination in `ITriggerDetector.hpp`
+Implemented in [include/Math/ITriggerDetector.hpp](file:///home/hward/Projects/GolfSim/include/Math/ITriggerDetector.hpp):
 ```cpp
-virtual bool checkTrigger(const cv::Mat& l, const cv::Mat& r) { return checkOpticalGate(l); }
-virtual bool checkOpticalGate(const cv::Mat& c) { return checkTrigger(c, c); }
-```
-If a subclass overrides neither or calls `ITriggerDetector::checkOpticalGate()`, it triggers infinite recursion and stack overflow.
-**Fix**: Declare `checkTrigger(const cv::Mat&, const cv::Mat&) = 0;` as pure virtual, and make `checkOpticalGate()` a non-virtual helper delegating strictly in one direction.
+// Pure virtual stereoscopic trigger evaluator
+virtual bool checkTrigger(const cv::Mat& leftFrame, const cv::Mat& rightFrame) = 0;
 
-### 3.2 Monotonic Flight-Axis Sorting
-In `StereoTriangulator::triangulateShot()`, centroids are sorted by horizontal coordinate:
-```cpp
-std::sort(sortedLeftIdx.begin(), sortedLeftIdx.end(), [&](size_t a, size_t b) {
-    return rectLeft[a].x < rectLeft[b].x;
-});
+// Legacy single-frame optical gate helper delegating strictly in one direction
+bool checkOpticalGate(const cv::Mat& currentFrame) {
+    return checkTrigger(currentFrame, currentFrame);
+}
 ```
-To support both left-to-right and right-to-left configurations or steep vertical launches (lob wedges), we project centroids onto the principal motion vector rather than assuming raw $X$-axis ordering.
+- `BallPresenceTrigger` overrides `checkTrigger()` and evaluates the optical gate on the incoming frame.
+- `StereoBallTrackerTrigger` overrides `checkTrigger()` and inherits the clean helper.
+- Circular delegation is completely eliminated with zero risk of stack overflow.
+
+### 3.2 Principal Motion Vector Trajectory Sorting
+Implemented via `sortAlongPrincipalAxis()` in [src/Math/StereoTriangulator.cpp](file:///home/hward/Projects/GolfSim/src/Math/StereoTriangulator.cpp):
+
+Rather than assuming horizontal image ordering ($x_a < x_b$), which fails on steep vertical launches (e.g., $70^\circ$ lob wedges) or opposite-handed bays:
+1. Computes mean 2D centroid $(\bar{x}, \bar{y})$ and $2 \times 2$ covariance matrix:
+   $$C = \begin{pmatrix} c_{xx} & c_{xy} \\ c_{xy} & c_{yy} \end{pmatrix}$$
+2. Analytically determines the principal eigenvector $\mathbf{v} = (v_x, v_y)$ representing the dominant flight path axis.
+3. Orients $\mathbf{v}$ along the flight direction:
+   - If $|v_x| > 0.1$: Aligns with `flightDirectionX` ($+1.0$ default for left-to-right, $-1.0$ for right-to-left).
+   - If $|v_x| \le 0.1$ (steep vertical lob wedge): Orients along $-Y$ (upward motion toward decreasing image row index).
+4. Projects 2D pulse centroids onto $\mathbf{v}$:
+   $$s_i = (\mathbf{p}_i - \mathbf{\bar{p}}) \cdot \mathbf{v}$$
+5. Orders observations and stereo matches chronologically based on $s_i < s_j$, guaranteeing monotonic time progression for the kinematics engine.
+
 
