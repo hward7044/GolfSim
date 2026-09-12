@@ -509,10 +509,6 @@ bool StereoBallTrackerTrigger::checkTrigger(const cv::Mat &leftFrame,
   return false;
 }
 
-bool StereoBallTrackerTrigger::checkOpticalGate(const cv::Mat &currentFrame) {
-  return checkTrigger(currentFrame, currentFrame);
-}
-
 void StereoBallTrackerTrigger::reset() {
   state_ = StereoTriggerState::SEARCHING;
   lastKnown3DPos_ = Eigen::Vector3d(0.0, 0.0, 0.0);

@@ -40,6 +40,10 @@ BallPresenceTrigger::BallPresenceTrigger(
     };
 }
 
+bool BallPresenceTrigger::checkTrigger(const cv::Mat& leftFrame, const cv::Mat& /*rightFrame*/) {
+    return checkOpticalGate(leftFrame);
+}
+
 bool BallPresenceTrigger::checkOpticalGate(const cv::Mat& currentFrame) {
     if (currentFrame.empty()) {
         return false;

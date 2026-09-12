@@ -57,7 +57,8 @@ public:
         double lossTimeout = 5.0
     );
 
-    bool checkOpticalGate(const cv::Mat& currentFrame) override;
+    bool checkTrigger(const cv::Mat& leftFrame, const cv::Mat& rightFrame) override;
+    bool checkOpticalGate(const cv::Mat& currentFrame);
     void reset() override;
 
     EmitterPowerMode getEmitterMode() const noexcept { return emitterMode; }

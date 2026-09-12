@@ -101,6 +101,13 @@ void testBallPresenceTrigger() {
     assert(trigger.getEmitterMode() == EmitterPowerMode::HIGH_STROBE_READY);
     assert(!trigger.isStandbyRequested());
 
+    // Verify ITriggerDetector interface polymorphism and zero recursion
+    ITriggerDetector* baseDetector = &trigger;
+    bool trigPoly1 = baseDetector->checkTrigger(ballFrame, ballFrame);
+    bool trigPoly2 = baseDetector->checkOpticalGate(ballFrame);
+    (void)trigPoly1;
+    (void)trigPoly2;
+
     spdlog::info("[TEST] BallPresenceTrigger verification passed (including dynamic emitter protection).");
 }
 
@@ -225,6 +232,43 @@ void testStereoTriangulatorAndRaySphere() {
     // The recovered position should be extremely close to (0.0, 0.021335, 1.5)
     assert(std::abs(resultSingle[0].markers[0].position.y() - 0.021335) < 1e-3);
     assert(std::abs(resultSingle[0].markers[0].position.z() - 1.5) < 1e-3);
+
+    // Test single-camera ray-sphere fallback for Right camera:
+    // If marker is only visible in Right camera, remove it from Left:
+    bL.markers.clear();
+    bR.markers.push_back(mr);
+    auto resultRightOnly = solver.triangulateShot({ bL }, { bR });
+    assert(resultRightOnly.size() == 1);
+    assert(resultRightOnly[0].markers.size() == 1);
+    assert(!resultRightOnly[0].markers[0].isStereo);
+    assert(resultRightOnly[0].markers[0].confidence == 0.5);
+    // The recovered position in world (Left camera) coords must match (0.0, 0.021335, 1.5)
+    assert(std::abs(resultRightOnly[0].markers[0].position.x() - 0.0) < 1e-3);
+    assert(std::abs(resultRightOnly[0].markers[0].position.y() - 0.021335) < 1e-3);
+    assert(std::abs(resultRightOnly[0].markers[0].position.z() - 1.5) < 1e-3);
+
+    // Test Principal Motion Vector Trajectory Sorting:
+    // Create a steep vertical launch shot (lob wedge):
+    // Pulse 0 (lowest in air): Left u = 640.0, v = 466.67 | Right u = 573.33, v = 466.67
+    // Pulse 1 (mid air): Left u = 638.0 (slight horizontal jitter), v = 400.00 | Right u = 571.33, v = 400.00
+    // Pulse 2 (highest in air): Left u = 666.67, v = 333.33 | Right u = 600.00, v = 333.33
+    BallObservation p0_L, p0_R, p1_L, p1_R, p2_L, p2_R;
+    p0_L.centroid = cv::Point2d(640.0, 466.67);
+    p0_R.centroid = cv::Point2d(573.333333, 466.67);
+
+    p1_L.centroid = cv::Point2d(638.0, 400.00);
+    p1_R.centroid = cv::Point2d(571.333333, 400.00);
+
+    p2_L.centroid = cv::Point2d(666.67, 333.33);
+    p2_R.centroid = cv::Point2d(600.00, 333.33);
+
+    // Pass them intentionally out-of-order: { p2, p0, p1 }
+    auto steepTrajectory = solver.triangulateShot({ p2_L, p0_L, p1_L }, { p2_R, p0_R, p1_R });
+    assert(steepTrajectory.size() == 3);
+    // Principal motion vector projection must restore exact chronological order: p0 -> p1 -> p2
+    // In world coordinates, +Y is down, so p0 (lowest) has highest Y, p2 (highest) has lowest Y.
+    assert(steepTrajectory[0].centroid.y() > steepTrajectory[1].centroid.y());
+    assert(steepTrajectory[1].centroid.y() > steepTrajectory[2].centroid.y());
 
     spdlog::info("[TEST] StereoTriangulator and Ray-Sphere Fallback verification passed.");
 }

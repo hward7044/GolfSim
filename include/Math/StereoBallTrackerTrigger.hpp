@@ -114,7 +114,6 @@ public:
 
   bool checkTrigger(const cv::Mat &leftFrame,
                     const cv::Mat &rightFrame) override;
-  bool checkOpticalGate(const cv::Mat &currentFrame) override;
   void reset() override;
 
   StereoTriggerState getState() const { return state_; }

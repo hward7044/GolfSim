@@ -3,6 +3,137 @@
 #include <opencv2/stereo.hpp>
 #include <algorithm>
 #include <cmath>
+#include <Eigen/Core>
+#include <Eigen/Dense>
+
+void StereoTriangulator::updateExtrinsics() {
+    if (!calib_.R.empty() && !calib_.T.empty()) {
+        cv::Mat R_double;
+        calib_.R.convertTo(R_double, CV_64F);
+        cv::Mat T_double;
+        calib_.T.convertTo(T_double, CV_64F);
+
+        Eigen::Matrix3d R_eigen;
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                R_eigen(i, j) = R_double.at<double>(i, j);
+            }
+        }
+        Eigen::Vector3d T_eigen(
+            T_double.at<double>(0, 0),
+            T_double.at<double>(1, 0),
+            T_double.at<double>(2, 0)
+        );
+
+        // Right-to-world (Left camera) rotation: R_inv = R^T
+        R_inv_ = R_eigen.transpose();
+        // Right camera optical center in world (Left camera) coords: O_R = -R^T * T
+        rightOpticalCenter_ = -R_inv_ * T_eigen;
+    }
+}
+
+// Sorts 2D observation indices along the principal motion axis using covariance analysis.
+// Orients the vector in the flight direction (+X default, with -Y upwards tie-break for steep launches).
+static std::vector<std::size_t> sortAlongPrincipalAxis(
+    const std::vector<cv::Point2d>& pts,
+    std::vector<double>& outProjections,
+    double flightDirectionX = 1.0
+) {
+    std::size_t n = pts.size();
+    std::vector<std::size_t> indices(n);
+    for (std::size_t i = 0; i < n; ++i) indices[i] = i;
+    outProjections.assign(n, 0.0);
+
+    if (n < 2) {
+        return indices;
+    }
+
+    // Compute centroid
+    double meanX = 0.0;
+    double meanY = 0.0;
+    for (const auto& pt : pts) {
+        meanX += pt.x;
+        meanY += pt.y;
+    }
+    meanX /= static_cast<double>(n);
+    meanY /= static_cast<double>(n);
+
+    // Compute 2x2 covariance matrix
+    double cxx = 0.0;
+    double cyy = 0.0;
+    double cxy = 0.0;
+    for (const auto& pt : pts) {
+        double dx = pt.x - meanX;
+        double dy = pt.y - meanY;
+        cxx += dx * dx;
+        cyy += dy * dy;
+        cxy += dx * dy;
+    }
+    cxx /= static_cast<double>(n);
+    cyy /= static_cast<double>(n);
+    cxy /= static_cast<double>(n);
+
+    // Compute principal eigenvector analytically for 2x2 symmetric matrix
+    double trace = cxx + cyy;
+    double det = cxx * cyy - cxy * cxy;
+    double disc = std::max(0.0, trace * trace - 4.0 * det);
+    double lambda1 = (trace + std::sqrt(disc)) * 0.5;
+
+    double vx = 1.0;
+    double vy = 0.0;
+
+    if (std::abs(cxy) > 1e-9) {
+        vx = lambda1 - cyy;
+        vy = cxy;
+    } else {
+        if (cyy > cxx) {
+            vx = 0.0;
+            vy = 1.0;
+        } else {
+            vx = 1.0;
+            vy = 0.0;
+        }
+    }
+
+    double norm = std::hypot(vx, vy);
+    if (norm > 1e-9) {
+        vx /= norm;
+        vy /= norm;
+    } else {
+        vx = (flightDirectionX >= 0.0) ? 1.0 : -1.0;
+        vy = 0.0;
+    }
+
+    // Orient principal vector downrange in flight direction:
+    // In camera image space:
+    // - Horizontal flight is along +X (if flightDirectionX > 0) or -X (if flightDirectionX < 0)
+    // - Upward launch into the air corresponds to decreasing Y (vy < 0 in OpenCV image coordinates)
+    double targetSignX = (flightDirectionX >= 0.0) ? 1.0 : -1.0;
+    if (std::abs(vx) > 0.1) {
+        if ((vx * targetSignX) < 0.0) {
+            vx = -vx;
+            vy = -vy;
+        }
+    } else {
+        // Steep vertical launch (e.g. lob wedge): horizontal delta is near zero
+        // In image pixels, upward motion into the air has decreasing Y (vy < 0)
+        if (vy > 0.0) {
+            vx = -vx;
+            vy = -vy;
+        }
+    }
+
+    // Project points onto the oriented principal vector: s = (p - mean) . v
+    for (std::size_t i = 0; i < n; ++i) {
+        outProjections[i] = (pts[i].x - meanX) * vx + (pts[i].y - meanY) * vy;
+    }
+
+    std::sort(indices.begin(), indices.end(), [&](std::size_t a, std::size_t b) {
+        return outProjections[a] < outProjections[b];
+    });
+
+    return indices;
+}
 
 StereoTriangulator::StereoTriangulator() : ballRadius_(0.021335) {
     // Default calibration parameters mapping to a horizontal stereo setup with 100mm baseline
@@ -21,13 +152,18 @@ StereoTriangulator::StereoTriangulator() : ballRadius_(0.021335) {
     // Identity projection matrices
     calib_.P_L = cv::Mat_<double>({3, 4}, {1000.0, 0.0, 640.0, 0.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0});
     calib_.P_R = cv::Mat_<double>({3, 4}, {1000.0, 0.0, 640.0, -100.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0});
+
+    updateExtrinsics();
 }
 
 StereoTriangulator::StereoTriangulator(const StereoCalibration& calib, double ballRadius)
-    : calib_(calib), ballRadius_(ballRadius) {}
+    : calib_(calib), ballRadius_(ballRadius) {
+    updateExtrinsics();
+}
 
 void StereoTriangulator::setCalibration(const StereoCalibration& calib) {
     calib_ = calib;
+    updateExtrinsics();
 }
 
 std::vector<Ball3D> StereoTriangulator::triangulateShot(
@@ -55,18 +191,12 @@ std::vector<Ball3D> StereoTriangulator::triangulateShot(
         cv::undistortPoints(rightPts, rectRight, calib_.K_R, calib_.D_R, calib_.R_R, calib_.P_R);
     }
 
-    // 2. Sort indices horizontally (downrange along X) to preserve chronological path structure
-    std::vector<std::size_t> sortedLeftIdx(leftObs.size());
-    for (std::size_t i = 0; i < leftObs.size(); ++i) sortedLeftIdx[i] = i;
-    std::sort(sortedLeftIdx.begin(), sortedLeftIdx.end(), [&](std::size_t a, std::size_t b) {
-        return rectLeft[a].x < rectLeft[b].x;
-    });
+    // 2. Sort indices along principal motion axis to preserve chronological path structure
+    std::vector<double> leftProjections;
+    std::vector<std::size_t> sortedLeftIdx = sortAlongPrincipalAxis(rectLeft, leftProjections, flightDirectionX_);
 
-    std::vector<std::size_t> sortedRightIdx(rightObs.size());
-    for (std::size_t j = 0; j < rightObs.size(); ++j) sortedRightIdx[j] = j;
-    std::sort(sortedRightIdx.begin(), sortedRightIdx.end(), [&](std::size_t a, std::size_t b) {
-        return rectRight[a].x < rectRight[b].x;
-    });
+    std::vector<double> rightProjections;
+    std::vector<std::size_t> sortedRightIdx = sortAlongPrincipalAxis(rectRight, rightProjections, flightDirectionX_);
 
     // 3. Match Left and Right centroids using epipolar and disparity constraints
     std::vector<std::pair<std::size_t, std::size_t>> matches;
@@ -97,9 +227,9 @@ std::vector<Ball3D> StereoTriangulator::triangulateShot(
         }
     }
 
-    // Sort matches chronologically based on Left observation X position
+    // Sort matches chronologically based on Left observation projection along principal flight axis
     std::sort(matches.begin(), matches.end(), [&](const auto& a, const auto& b) {
-        return rectLeft[a.first].x < rectLeft[b.first].x;
+        return leftProjections[a.first] < leftProjections[b.first];
     });
 
     // 4. Triangulate the matched pairs
@@ -237,22 +367,9 @@ std::vector<Ball3D> StereoTriangulator::triangulateShot(
             Eigen::Vector3d rayCamR(x_norm, y_norm, 1.0);
             rayCamR.normalize();
 
-            // Convert ray to world (Left camera) coordinates
-            cv::Mat R_double;
-            calib_.R.convertTo(R_double, CV_64F);
-            cv::Mat T_double;
-            calib_.T.convertTo(T_double, CV_64F);
-
-            Eigen::Matrix3d R_eigen;
-            for (int i = 0; i < 3; ++i) {
-                for (int j = 0; j < 3; ++j) {
-                    R_eigen(i, j) = R_double.at<double>(i, j);
-                }
-            }
-            Eigen::Vector3d T_eigen(T_double.at<double>(0, 0), T_double.at<double>(1, 0), T_double.at<double>(2, 0));
-
-            Eigen::Vector3d rayDir = R_eigen * rayCamR;
-            Eigen::Vector3d O = T_eigen; // Optical center of right camera in world (Left camera) coords
+            // Transform ray to world (Left camera) coordinates using precomputed extrinsics
+            Eigen::Vector3d rayDir = (R_inv_ * rayCamR).normalized();
+            Eigen::Vector3d O = rightOpticalCenter_; // Exact optical center of right camera in world coords
             
             Eigen::Vector3d w_vec = O - ballCentroid3D;
             double dot = w_vec.dot(rayDir);
