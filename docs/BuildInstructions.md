@@ -24,3 +24,19 @@ $cmake = "C:\Program Files\Microsoft Visual Studio\2022\Professional\Common7\IDE
 ```
 
 *Note: If files are added or deleted, make sure to re-run the configure preset (`--preset default`) before building.*
+
+---
+
+## Linux Environment (Arch / Omarchy)
+
+For detailed information on installed tools, compilers, and library versions, see [ToolsAndLibraries.md](file:///home/hward/Projects/GolfSim/docs/ToolsAndLibraries.md).
+
+On Linux, dependencies (OpenCV 5, Eigen3, spdlog, nlohmann_json) and tools (CMake, Ninja, GCC) are available directly on the system path:
+
+```bash
+# Configure
+cmake -B build -S .
+
+# Build
+cmake --build build
+```
