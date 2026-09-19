@@ -5,7 +5,7 @@ Runs a live webcam feed from cameras 0 and 1, with real-time thresholding
 and glint detection to verify IR emitter circuit output and retroreflective ball dots.
 
 Usage:
-  python tools/debug_ir_strobe.py [--left-cam 1] [--right-cam 0] [--thresh 200]
+  python tools/debug_ir_strobe.py [--left-cam 1] [--right-cam 2] [--thresh 200]
 """
 
 import sys
@@ -16,7 +16,7 @@ import argparse
 def main():
     parser = argparse.ArgumentParser(description="GolfSim IR Strobe & Retroreflective Dot Visualizer")
     parser.add_argument("--left-cam", type=int, default=1, help="Device index for Left camera (default: 1)")
-    parser.add_argument("--right-cam", type=int, default=0, help="Device index for Right camera (default: 0)")
+    parser.add_argument("--right-cam", type=int, default=2, help="Device index for Right camera (default: 2)")
     parser.add_argument("--thresh", type=int, default=200, help="Initial threshold level (default: 200)")
     args = parser.parse_args()
 
@@ -42,8 +42,8 @@ def main():
     print("=======================================================\n")
 
     win_name = "GolfSim IR Strobe Debugger"
-    cv.namedWindow(win_name, cv2.WINDOW_NORMAL)
-    cv.resizeWindow(win_name, 1280, 800)
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win_name, 1280, 800)
 
     while True:
         retL, frameL = capL.read() if capL.isOpened() else (False, None)

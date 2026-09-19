@@ -46,6 +46,9 @@ target_link_libraries(golfsim_core PUBLIC
 
 # OS-Specific API configuration
 if(WIN32)
+    # <windows.h> (via Media Foundation / Winsock) defines min/max macros that
+    # break std::numeric_limits<T>::max() and friends.
+    target_compile_definitions(golfsim_core PUBLIC NOMINMAX)
     # Link Windows Media Foundation and Winsock libraries
     target_link_libraries(golfsim_core PUBLIC
         mfplat
@@ -124,6 +127,10 @@ if(GOLFSIM_BUILD_TESTS)
         AsyncFlightRecorderStream
         SessionStateMachineStroboscopicTiming
         SerialPort
+        CameraConfig
+        AppConfig
+        DotClusterFinder
+        DotClusterTracker
     )
     foreach(case ${GOLFSIM_TEST_CASES})
         add_test(NAME ${case} COMMAND GolfSimTests ${case})

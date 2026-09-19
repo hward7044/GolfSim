@@ -3,6 +3,7 @@
 #include "Math/ITriggerDetector.hpp"
 #include "Math/StereoTriangulator.hpp"
 #include "Math/EmitterPowerMode.hpp"
+#include "Math/DotClusterFinder.hpp"
 
 #include <Eigen/Core>
 #include <chrono>
@@ -20,23 +21,25 @@ struct BlobCandidate {
   double area;
   double radius;
   double circularity;
+  int dotCount = 0;
 };
 
+/// Stereo ball-presence trigger over the dot-cluster detector. Searches the
+/// whole frame — with continuous 300 Hz strobing there is no time pressure
+/// before the shot, so the ball may sit anywhere in view (refactor 09, 3.7).
 class StereoBallTrackerTrigger : public ITriggerDetector,
                                  public IDiagnosticProvider {
 private:
   StereoCalibration calib_;
   StereoTriggerState state_;
 
-  // Target optical parameters for 2 ft (~600 mm) setup
-  cv::Rect searchRoiLeft_;
-  cv::Rect searchRoiRight_;
-  double minBallRadiusPx_;
-  double maxBallRadiusPx_;
-  double minBallArea_;
-  double maxBallArea_;
-  double minCircularity_;
-  int ballThreshold_;
+  // Dots-only detection, shared configuration with the vision stage
+  DotClusterFinder finder_;
+  DotClusterResult resultL_;
+  DotClusterResult resultR_;
+  double nominalBallRadiusPx_;
+
+  // Stereo pairing gates (AppConfig.stereo)
   double epipolarTolerancePx_;
   double disparityMinPx_;
   double disparityMaxPx_;
@@ -72,8 +75,6 @@ private:
   // Zero-allocation scratchpad matrices
   cv::Mat grayL_;
   cv::Mat grayR_;
-  cv::Mat threshL_;
-  cv::Mat threshR_;
   cv::Mat pt_temp_;
   cv::Mat und_temp_;
   cv::Mat pt2D_L_;
@@ -86,9 +87,15 @@ private:
 
   // Helper functions
   std::vector<BlobCandidate>
-  extractCandidates(const cv::Mat &grayFrame, const cv::Rect &searchROI,
+  extractCandidates(const cv::Mat &grayFrame, DotClusterResult &scratch,
                     const cv::Mat &K, const cv::Mat &D, const cv::Mat &R_rect,
                     const cv::Mat &P_rect);
+
+  /// Candidates whose centroid lies inside the armed tracking window around
+  /// `center` (ARMED / CONFIRMING follow the locked ball, not the whole frame).
+  static std::vector<BlobCandidate>
+  withinWindow(const std::vector<BlobCandidate> &candidates,
+               const cv::Point2d &center, int windowSize);
 
   cv::Point2d rectifyPoint(const cv::Point2d &pt, const cv::Mat &K,
                            const cv::Mat &D, const cv::Mat &R_rect,
@@ -110,15 +117,14 @@ private:
 
 public:
   StereoBallTrackerTrigger(StereoCalibration calib = StereoCalibration(),
-                           cv::Rect searchRoiLeft = cv::Rect(350, 440, 600, 310),
-                           cv::Rect searchRoiRight = cv::Rect(350, 440, 600, 310),
-                           double minRadius = 15.0, double maxRadius = 85.0,
-                           double minCirc = 0.25, int thresh = 120,
-                           double epipolarTol = 65.0, int armedWinSize = 256,
-                           double max3DDist = 0.9144, int searchLockFrames = 5,
-                           int graceMax = 4, double impactVelThresh = 4.0,
-                           double motionDispThresh = 0.04, double minArea = 150.0,
-                           double maxArea = 8500.0);
+                           DotClusterConfig dotConfig = DotClusterConfig(),
+                           double nominalBallRadiusPx = 23.3,
+                           double epipolarTol = 150.0,
+                           double disparityMin = 5.0, double disparityMax = 600.0,
+                           int armedWinSize = 256, double max3DDist = 0.9144,
+                           int searchLockFrames = 5, int graceMax = 4,
+                           double impactVelThresh = 4.0,
+                           double motionDispThresh = 0.04);
 
   bool checkTrigger(const cv::Mat &leftFrame,
                     const cv::Mat &rightFrame) override;
@@ -128,8 +134,12 @@ public:
   Eigen::Vector3d getLastKnown3DPosition() const { return lastKnown3DPos_; }
 
   EmitterPowerMode getEmitterMode() const noexcept { return emitterMode_; }
-  bool isStandbyRequested() const noexcept { return emitterMode_ == EmitterPowerMode::LOW_STANDBY; }
+  bool isStandbyRequested() const noexcept {
+    return emitterMode_ == EmitterPowerMode::LOW_STANDBY;
+  }
   void setLossTimeoutSec(double sec) noexcept { ballLossTimeoutSec_ = sec; }
+
+  const DotClusterConfig &dotConfig() const noexcept { return finder_.config(); }
 
   nlohmann::json getLatestDiagnostics() const override { return latestDiag_; }
 };

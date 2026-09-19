@@ -1,0 +1,25 @@
+{
+  "camera": {
+    "exposureUs": 7812,
+    "gain": 0,
+    "brightness": 0,
+    "targetFps": 100
+  },
+  "detector": {
+    "intensityThreshold": 135,
+    "minDotArea": 2,
+    "maxDotArea": 120,
+    "maxDotAspect": 2.5,
+    "clusterRadiusPx": 28,
+    "minDotsPerCluster": 3,
+    "maxDotsPerCluster": 40,
+    "maxClusterSpreadPx": 47,
+    "minClusterSpreadPx": 6
+  },
+  "stereo": {
+    "epipolarTolerancePx": 150,
+    "disparityMinPx": 5,
+    "disparityMaxPx": 600,
+    "swapCameras": false
+  }
+}

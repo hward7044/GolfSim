@@ -1,5 +1,6 @@
 #pragma once
 #include "Math/ITriggerDetector.hpp"
+#include "Math/DotClusterFinder.hpp"
 #include "Diagnostics/IDiagnosticProvider.hpp"
 #include <opencv2/core.hpp>
 #include <nlohmann/json.hpp>
@@ -13,14 +14,15 @@ enum class TriggerState {
 
 #include "Math/EmitterPowerMode.hpp"
 
+/// Single-camera presence trigger over the dot-cluster detector: locks when
+/// exactly one dot cluster sits still for `lockFrames`, then watches the
+/// locked patch with template matching until the dot pattern vanishes.
+/// Searches the whole frame (refactor 09, 3.7).
 class BallPresenceTrigger : public ITriggerDetector, public IDiagnosticProvider {
 private:
-    cv::Rect     teeROI;
+    DotClusterFinder finder;
+    DotClusterResult result;
     int          lockFrameCount;
-    int          ballThreshold;
-    double       minBallArea;
-    double       maxBallArea;
-    double       minCircularity;
     float        matchScoreThreshold;
     double       lossTimeoutSec;
 
@@ -36,20 +38,16 @@ private:
     EmitterPowerMode emitterMode = EmitterPowerMode::HIGH_STROBE_READY;
 
     // Scratchpad variables for zero-allocation hot path
-    cv::Mat      grayRoi;
-    cv::Mat      threshRoi;
+    cv::Mat      gray;
     cv::Mat      matchResult;
 
     nlohmann::json latestDiag;
 
 public:
     BallPresenceTrigger(
-        cv::Rect roi = cv::Rect(400, 460, 160, 160),
+        DotClusterConfig dotConfig = DotClusterConfig(),
+        double nominalBallRadiusPx = 23.3,
         int lockFrames = 30,
-        int thresh = 120,
-        double minArea = 80.0,
-        double maxArea = 2500.0,
-        double minCirc = 0.65,
         float matchThreshold = 0.45f,
         double lossTimeout = 5.0
     );

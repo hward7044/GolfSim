@@ -44,8 +44,13 @@ struct PipelineTimingConfig {
     double standbyStrobeRateHz   = 10.0;
 
     /// Camera hardware exposure duration in microseconds.
-    /// Default: 10,000 us (10.0 ms) to capture 3 distinct pulses at 300 Hz per frame.
-    int    cameraExposureUs      = 10000;
+    /// Default: 7,812 us — the smallest UVC log2 exposure step that holds all 3
+    /// pulses of a 300 Hz train (6,696 us) and still fits the 10 ms frame period.
+    /// Set from CameraConfig::exposureUs at startup (refactor 09).
+    int    cameraExposureUs      = 7812;
+
+    /// Camera frame rate the exposure window must fit inside (Hz).
+    double cameraFrameRateHz     = 100.0;
 
     /// Expected number of stroboscopic pulses captured within each camera exposure window.
     int    strobePulseCount      = 3;
@@ -61,12 +66,29 @@ struct PipelineTimingConfig {
         }
     }
 
-    /// Validates that camera exposure window is long enough to encompass all sub-pulses.
+    /// Duration of the full strobe train (first pulse start to last pulse end), microseconds.
+    double strobeTrainDurationUs() const noexcept {
+        if (strobePulseCount <= 0) return 0.0;
+        return (strobePulseCount - 1) * (pulseIntervalMs * 1000.0) + subPulseDurationUs;
+    }
+
+    /// Frame period implied by cameraFrameRateHz, microseconds (0 if unset).
+    double framePeriodUs() const noexcept {
+        return cameraFrameRateHz > 0.0 ? 1e6 / cameraFrameRateHz : 0.0;
+    }
+
+    /// Validates that the exposure window holds every sub-pulse and still fits
+    /// inside one frame period at the configured frame rate.
     bool isValidTiming() const noexcept {
         if (cameraExposureUs <= 0 || pulseIntervalMs <= 0.0 || strobePulseCount <= 0) {
             return false;
         }
-        double trainDurationUs = (strobePulseCount - 1) * (pulseIntervalMs * 1000.0) + subPulseDurationUs;
-        return cameraExposureUs >= static_cast<int>(trainDurationUs);
+        if (cameraExposureUs < static_cast<int>(strobeTrainDurationUs())) {
+            return false;
+        }
+        if (cameraFrameRateHz > 0.0 && cameraExposureUs >= static_cast<int>(framePeriodUs())) {
+            return false;
+        }
+        return true;
     }
 };

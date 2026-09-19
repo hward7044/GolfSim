@@ -27,7 +27,6 @@ static constexpr uint32_t REQUESTED_WIDTH   = 1280;
 static constexpr uint32_t REQUESTED_HEIGHT  = 800;
 static constexpr uint32_t MMAP_BUFFER_COUNT = 4;      // Shallow queue: low latency, ring buffer absorbs jitter
 static constexpr int      GRAB_POLL_TIMEOUT_MS = 100; // Bounded so shutdown() can interrupt a stalled grab
-static constexpr int      DEFAULT_EXPOSURE_US = 10000; // 10 ms: captures 3 pulses at 300 Hz (refactor 02)
 
 // Pixel formats we can turn into a CV_8UC1 Y-plane without decoding, in preference order.
 static constexpr uint32_t PREFERRED_FORMATS[] = {
@@ -65,6 +64,14 @@ static bool setControl(int fd, uint32_t id, int32_t value) {
     ctrl.id = id;
     ctrl.value = value;
     return xioctl(fd, VIDIOC_S_CTRL, &ctrl) == 0;
+}
+
+static bool getControl(int fd, uint32_t id, int32_t& valueOut) {
+    v4l2_control ctrl{};
+    ctrl.id = id;
+    if (xioctl(fd, VIDIOC_G_CTRL, &ctrl) != 0) return false;
+    valueOut = ctrl.value;
+    return true;
 }
 
 // Returns true if the control exists and fills min/max; false if unsupported.
@@ -194,7 +201,9 @@ void V4L2Driver::logConnectedDevices() {
 // Construction / Destruction
 // =============================================================================
 
-V4L2Driver::V4L2Driver(uint32_t logicalIndex) {
+V4L2Driver::V4L2Driver(uint32_t logicalIndex, CameraConfig config)
+    : config_(std::move(config)) {
+    config_.clampToHardwareRanges();
     auto devices = enumerateCaptureDevices();
     if (logicalIndex < devices.size()) {
         devicePath_ = devices[logicalIndex];
@@ -204,8 +213,10 @@ V4L2Driver::V4L2Driver(uint32_t logicalIndex) {
     }
 }
 
-V4L2Driver::V4L2Driver(std::string devicePath)
-    : devicePath_(std::move(devicePath)) {}
+V4L2Driver::V4L2Driver(std::string devicePath, CameraConfig config)
+    : devicePath_(std::move(devicePath)), config_(std::move(config)) {
+    config_.clampToHardwareRanges();
+}
 
 V4L2Driver::~V4L2Driver() {
     shutdown();
@@ -225,7 +236,7 @@ bool V4L2Driver::initialize() {
 
     if (!openDevice()      ||
         !negotiateFormat() ||
-        !selectMaxFrameRate()) {
+        !selectFrameRate()) {
         shutdown();
         return false;
     }
@@ -238,8 +249,9 @@ bool V4L2Driver::initialize() {
     }
 
     initialized_ = true;
-    spdlog::info("[V4L2Driver] {} ready: {}x{} {} stride={}",
-                 devicePath_, width_, height_, fourccToString(pixFmt_), stride_);
+    spdlog::info("[V4L2Driver] {} ready: {}x{} {} stride={} | exposure {} us, gain {}, {:.1f} fps",
+                 devicePath_, width_, height_, fourccToString(pixFmt_), stride_,
+                 appliedExposureUs_, appliedGain_, negotiatedFps_);
     return true;
 }
 
@@ -357,16 +369,20 @@ bool V4L2Driver::negotiateFormat() {
 }
 
 // =============================================================================
-// Internal: frame rate — pick the shortest interval the device advertises
+// Internal: frame rate — the advertised interval closest to (and at least)
+// the configured target, else the fastest the device offers
 // =============================================================================
 
-bool V4L2Driver::selectMaxFrameRate() {
+bool V4L2Driver::selectFrameRate() {
     v4l2_frmivalenum ival{};
     ival.pixel_format = pixFmt_;
     ival.width  = width_;
     ival.height = height_;
 
-    double bestInterval = 0.0;  // seconds; 0 = none found
+    const double targetInterval = 1.0 / static_cast<double>(config_.targetFps);
+    double bestInterval = 0.0;   // seconds; 0 = none found
+    double fastest      = 0.0;
+    std::string advertised;
     for (ival.index = 0; xioctl(fd_, VIDIOC_ENUM_FRAMEINTERVALS, &ival) == 0; ++ival.index) {
         double seconds = 0.0;
         if (ival.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
@@ -375,12 +391,24 @@ bool V4L2Driver::selectMaxFrameRate() {
             // Stepwise/continuous: the minimum interval is the fastest rate
             seconds = static_cast<double>(ival.stepwise.min.numerator) / ival.stepwise.min.denominator;
         }
-        if (seconds > 0.0 && (bestInterval == 0.0 || seconds < bestInterval)) {
+        if (seconds <= 0.0) continue;
+        advertised += std::to_string(static_cast<int>(std::lround(1.0 / seconds))) + " ";
+        if (fastest == 0.0 || seconds < fastest) fastest = seconds;
+        // Meets the target: keep the slowest such rate (closest from above).
+        if (seconds <= targetInterval + 1e-9 && (bestInterval == 0.0 || seconds > bestInterval)) {
             bestInterval = seconds;
-            if (ival.type != V4L2_FRMIVAL_TYPE_DISCRETE) break;
         }
+        if (ival.type != V4L2_FRMIVAL_TYPE_DISCRETE) break;
     }
+    spdlog::info("[V4L2Driver] {} {}x{} advertises frame rates: [{}]",
+                 fourccToString(pixFmt_), width_, height_, advertised);
 
+    if (bestInterval == 0.0 && fastest > 0.0) {
+        spdlog::warn("[V4L2Driver] No {}x{} mode reaches {} fps; using {:.1f} fps. "
+                     "The strobe timing model assumes {} fps.",
+                     width_, height_, config_.targetFps, 1.0 / fastest, config_.targetFps);
+        bestInterval = fastest;
+    }
     if (bestInterval == 0.0) {
         spdlog::warn("[V4L2Driver] No frame intervals advertised; leaving driver default rate.");
         return true;  // Not fatal — stream at whatever the device defaults to
@@ -421,21 +449,18 @@ bool V4L2Driver::selectMaxFrameRate() {
         return true;
     }
 
-    double achieved = static_cast<double>(parm.parm.capture.timeperframe.denominator) /
-                      parm.parm.capture.timeperframe.numerator;
-    spdlog::info("[V4L2Driver] Frame rate set to {:.1f} fps", achieved);
+    negotiatedFps_ = static_cast<double>(parm.parm.capture.timeperframe.denominator) /
+                     parm.parm.capture.timeperframe.numerator;
+    spdlog::info("[V4L2Driver] Frame rate set to {:.1f} fps (requested {} fps)",
+                 negotiatedFps_, config_.targetFps);
     return true;
 }
 
 // =============================================================================
-// Internal: manual exposure / gain — best effort, never fatal
+// Internal: exposure / gain / brightness — best effort, never fatal
 // =============================================================================
 
 void V4L2Driver::configureControls() {
-    // Manual exposure so the strobe pulses, not ambient light, define the image.
-    if (!setControl(fd_, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL)) {
-        spdlog::warn("[V4L2Driver] Could not set EXPOSURE_AUTO=MANUAL: {}", strerror(errno));
-    }
     // Stop the driver dropping the frame rate to satisfy a long exposure.
     if (!setControl(fd_, V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0)) {
         spdlog::debug("[V4L2Driver] EXPOSURE_AUTO_PRIORITY not supported ({})", strerror(errno));
@@ -447,15 +472,24 @@ void V4L2Driver::configureControls() {
     if (exposureSupported_) {
         spdlog::info("[V4L2Driver] Exposure range: {}..{} (x100us), default {}",
                      exposureMin_, exposureMax_, def);
-        setHardwareExposure(DEFAULT_EXPOSURE_US);
     } else {
         spdlog::warn("[V4L2Driver] EXPOSURE_ABSOLUTE control not available; exposure left at driver default.");
     }
 
-    int32_t gMin, gMax, gDef;
-    if (queryControlRange(fd_, V4L2_CID_AUTOGAIN, gMin, gMax, gDef)) {
-        setControl(fd_, V4L2_CID_AUTOGAIN, 0);
+    gainSupported_ = queryControlRange(fd_, V4L2_CID_GAIN, gainMin_, gainMax_, def);
+    if (gainSupported_) {
+        spdlog::info("[V4L2Driver] Gain range: {}..{}, default {}", gainMin_, gainMax_, def);
+    } else {
+        spdlog::warn("[V4L2Driver] GAIN control not available; gain left at driver default.");
     }
+
+    brightnessSupported_ = queryControlRange(fd_, V4L2_CID_BRIGHTNESS, brightnessMin_, brightnessMax_, def);
+    if (brightnessSupported_) {
+        spdlog::info("[V4L2Driver] Brightness range: {}..{}, default {}", brightnessMin_, brightnessMax_, def);
+    }
+
+    // Auto modes off first, then exposure, gain, brightness (IUsbVideoDriver order).
+    applyCameraConfig(config_);
 }
 
 // =============================================================================
@@ -605,14 +639,62 @@ bool V4L2Driver::grabRawFrame(cv::Mat& destination) {
 void V4L2Driver::setHardwareExposure(int microseconds) {
     if (fd_ < 0 || !exposureSupported_ || microseconds < 0) return;
 
-    // UVC exposure_time_absolute is in 100 us units
-    int32_t units = static_cast<int32_t>(std::lround(microseconds / 100.0));
+    // UVC exposure_time_absolute is in 100 us units. The OV9281 UVC bridge only
+    // realises power-of-two steps, so request the step the hardware will land
+    // on and read the applied value back.
+    const int snappedUs = CameraConfig::quantiseExposureUs(microseconds);
+    int32_t units = static_cast<int32_t>(std::lround(snappedUs / 100.0));
     units = std::clamp(units, exposureMin_, exposureMax_);
 
-    if (setControl(fd_, V4L2_CID_EXPOSURE_ABSOLUTE, units)) {
-        spdlog::debug("[V4L2Driver] Exposure set to {} us ({} x100us)", units * 100, units);
-    } else {
+    if (!setControl(fd_, V4L2_CID_EXPOSURE_ABSOLUTE, units)) {
         spdlog::warn("[V4L2Driver] Failed to set exposure {} us: {}", microseconds, strerror(errno));
+        return;
+    }
+    int32_t applied = units;
+    getControl(fd_, V4L2_CID_EXPOSURE_ABSOLUTE, applied);
+    appliedExposureUs_ = applied * 100;
+    spdlog::info("[V4L2Driver] Exposure requested {} us -> applied {} us ({} x100us)",
+                 microseconds, appliedExposureUs_, applied);
+}
+
+void V4L2Driver::setHardwareGain(int gain) {
+    if (fd_ < 0 || !gainSupported_) return;
+    int32_t value = std::clamp(static_cast<int32_t>(gain), gainMin_, gainMax_);
+    if (!setControl(fd_, V4L2_CID_GAIN, value)) {
+        spdlog::warn("[V4L2Driver] Failed to set gain {}: {}", gain, strerror(errno));
+        return;
+    }
+    int32_t applied = value;
+    getControl(fd_, V4L2_CID_GAIN, applied);
+    appliedGain_ = applied;
+    spdlog::info("[V4L2Driver] Gain requested {} -> applied {}", gain, appliedGain_);
+}
+
+void V4L2Driver::setHardwareBrightness(int level) {
+    if (fd_ < 0 || !brightnessSupported_) return;
+    int32_t value = std::clamp(static_cast<int32_t>(level), brightnessMin_, brightnessMax_);
+    if (!setControl(fd_, V4L2_CID_BRIGHTNESS, value)) {
+        spdlog::warn("[V4L2Driver] Failed to set brightness {}: {}", level, strerror(errno));
+        return;
+    }
+    spdlog::info("[V4L2Driver] Brightness (black level) set to {}", value);
+}
+
+void V4L2Driver::setAutoExposure(bool enabled) {
+    if (fd_ < 0) return;
+    // Manual exposure so the strobe pulses, not ambient light, define the image.
+    const int32_t mode = enabled ? V4L2_EXPOSURE_AUTO : V4L2_EXPOSURE_MANUAL;
+    if (!setControl(fd_, V4L2_CID_EXPOSURE_AUTO, mode)) {
+        spdlog::warn("[V4L2Driver] Could not set EXPOSURE_AUTO={}: {}",
+                     enabled ? "AUTO" : "MANUAL", strerror(errno));
+    }
+}
+
+void V4L2Driver::setAutoGain(bool enabled) {
+    if (fd_ < 0) return;
+    int32_t mn, mx, def;
+    if (queryControlRange(fd_, V4L2_CID_AUTOGAIN, mn, mx, def)) {
+        setControl(fd_, V4L2_CID_AUTOGAIN, enabled ? 1 : 0);
     }
 }
 

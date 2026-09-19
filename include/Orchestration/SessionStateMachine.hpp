@@ -164,6 +164,11 @@ public:
         onSerialCommand_ = std::move(cb);
     }
 
+    /// Applied camera/detector configuration, recorded into every replay's metadata.json.
+    void setSessionInfo(nlohmann::json info) {
+        recorder.setSessionInfo(std::move(info));
+    }
+
     void processNextFrame(const FrameSet& set) {
         cv::Mat leftFrame = set.getFrame(CameraRole::STEREO_LEFT);
         cv::Mat rightFrame = set.getFrame(CameraRole::STEREO_RIGHT);
@@ -174,14 +179,22 @@ public:
 
         nlohmann::json trigDiag;
 
-        // If in stream recording mode, buffer frames and write stream chunks to disk without waiting for a shot trigger
-        // Stream recording mode bypasses shot state machine
+        // If in stream recording mode, buffer frames and write stream chunks to disk without waiting for a shot trigger.
+        // The shot pipeline is bypassed, but the trigger and vision stages still run so
+        // the recording shows what was detected (dot clusters, stereo offsets, trigger state).
         if (streamRecordingMode) {
+            trigger.checkTrigger(leftFrame, rightFrame);
             if (streamFrameCount < streamFramesPool.size()) {
                 auto& rf = streamFramesPool[streamFrameCount++];
                 rf.timestamp = set.timestamp;
                 leftFrame.copyTo(rf.leftFrame);
                 rightFrame.copyTo(rf.rightFrame);
+                rf.triggerDiag = getTelemetry(trigger);
+                vision.detectBalls(leftFrame);
+                rf.leftVisionDiag = getTelemetry(vision);
+                vision.detectBalls(rightFrame);
+                rf.rightVisionDiag = getTelemetry(vision);
+                rf.triangulatedBalls.clear();
             }
 
             if (streamFrameCount >= streamFrameLimit) {

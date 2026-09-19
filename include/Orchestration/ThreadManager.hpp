@@ -3,7 +3,7 @@
 #include "Math/IBufferManager.hpp"
 #include "Math/StereoBallTrackerTrigger.hpp"
 #include "Math/BallPresenceTrigger.hpp"
-#include "Math/OpenCVMomentsTracker.hpp"
+#include "Math/DotClusterTracker.hpp"
 #include "Math/StereoTriangulator.hpp"
 #include "Math/EigenBallisticsEngine.hpp"
 #include "Math/TcpJsonTransmitter.hpp"
@@ -18,7 +18,7 @@
 // Static dispatch — zero virtual call overhead.
 using ConcreteSSM = SessionStateMachine<
     StereoBallTrackerTrigger,
-    OpenCVMomentsTracker,
+    DotClusterTracker,
     StereoTriangulator,
     EigenBallisticsEngine,
     TcpJsonTransmitter

@@ -4,6 +4,8 @@
 #include <iostream>
 #include <vector>
 #include <cmath>
+#include <tuple>
+#include <utility>
 #include <guiddef.h>
 #include <devpkey.h>
 #include <strmif.h>       // IAMCameraControl
@@ -35,12 +37,29 @@ static const GUID ARDUCAM_XU_GUID = {
 };
 static constexpr DWORD ARDUCAM_XU_CONTROL_ID = 1;
 
+// FrameSet::preallocate(1280, 800) is hardcoded upstream; the ring buffer's
+// zero-allocation contract depends on the camera delivering exactly this.
+static constexpr uint32_t REQUESTED_WIDTH  = 1280;
+static constexpr uint32_t REQUESTED_HEIGHT = 800;
+
+static const char* subtypeName(const GUID& subtype) {
+    if (subtype == MFVideoFormat_L8)    return "L8";
+    if (subtype == MFVideoFormat_NV12)  return "NV12";
+    if (subtype == MFVideoFormat_YUY2)  return "YUY2";
+    if (subtype == MFVideoFormat_MJPG)  return "MJPG";
+    if (subtype == MFVideoFormat_RGB24) return "RGB24";
+    if (subtype == MFVideoFormat_L16)   return "L16";
+    return "other";
+}
+
 // =============================================================================
 // Construction / Destruction
 // =============================================================================
 
-MediaFoundationDriver::MediaFoundationDriver(uint32_t deviceIndex)
-    : deviceIndex_(deviceIndex) {}
+MediaFoundationDriver::MediaFoundationDriver(uint32_t deviceIndex, CameraConfig config)
+    : deviceIndex_(deviceIndex), config_(std::move(config)) {
+    config_.clampToHardwareRanges();
+}
 
 MediaFoundationDriver::~MediaFoundationDriver() {
     shutdown();
@@ -84,8 +103,10 @@ bool MediaFoundationDriver::initialize() {
 
     initialized_ = true;
 
-    // Apply trigger and exposure configurations (non-blocking, failures logged as warnings)
-    configureTriggerAndExposureSettings();
+    // UVC controls: cache the interfaces once, then push the configured
+    // exposure / gain / brightness (failures logged as warnings, never fatal)
+    cacheControlInterfaces();
+    applyStartupConfig();
 
     return true;
 }
@@ -101,6 +122,8 @@ void MediaFoundationDriver::shutdown() {
 
     // Release in reverse order of acquisition
     ksControl_.Reset();
+    procAmp_.Reset();
+    cameraControl_.Reset();
     sourceReader_.Reset();
     mediaSource_.Reset();
 
@@ -304,52 +327,54 @@ bool MediaFoundationDriver::configureSourceReader() {
     if (FAILED(hr)) return false;
 
     // -------------------------------------------------------------------------
-    // Format negotiation: prefer native L8 (monochrome), fallback to NV12
+    // Format negotiation: the device advertises one native type per
+    // (subtype, size, frame rate). Log them all, then pick a 1280x800 L8/NV12
+    // type that reaches the configured frame rate (refactor 09, section 2.5).
     // -------------------------------------------------------------------------
-    DWORD mediaTypeIndex = 0;
-    ComPtr<IMFMediaType> pNV12Type;   // Track best NV12 candidate
-    ComPtr<IMFMediaType> pSelectedType;
-    bool foundL8 = false;
-
-    ComPtr<IMFMediaType> pCurrentType;
-    while (SUCCEEDED(sourceReader_->GetNativeMediaType(
-            MF_SOURCE_READER_FIRST_VIDEO_STREAM, mediaTypeIndex, &pCurrentType))) {
-
-        GUID majorType = GUID_NULL;
-        GUID subType = GUID_NULL;
-        pCurrentType->GetGUID(MF_MT_MAJOR_TYPE, &majorType);
-        pCurrentType->GetGUID(MF_MT_SUBTYPE, &subType);
-
-        if (majorType == MFMediaType_Video) {
-            if (subType == MFVideoFormat_L8) {
-                pSelectedType = pCurrentType;
-                isNV12_ = false;
-                foundL8 = true;
-                break;  // L8 is ideal, stop searching
-            } else if (subType == MFVideoFormat_NV12 && !pNV12Type) {
-                pNV12Type = pCurrentType;  // Save first NV12 candidate
-            }
-        }
-
-        pCurrentType.Reset();  // Release before next iteration
-        mediaTypeIndex++;
+    const std::vector<MediaTypeInfo> types = enumerateNativeMediaTypes();
+    spdlog::info("[MediaFoundationDriver] Device {} advertises {} native media types:",
+                 deviceIndex_, types.size());
+    for (const auto& t : types) {
+        spdlog::info("    [{:2}] {} {}x{} @ {:.1f} fps{}", t.index, subtypeName(t.subtype),
+                     t.width, t.height, t.fps, t.usable ? "" : "  (not usable)");
     }
 
-    // Use NV12 fallback if L8 not found
-    if (!foundL8 && pNV12Type) {
-        pSelectedType = pNV12Type;
-        isNV12_ = true;
-    }
-
-    if (!pSelectedType) {
+    const MediaTypeInfo* chosen = selectMediaType(types, REQUESTED_WIDTH, REQUESTED_HEIGHT,
+                                                  config_.targetFps);
+    if (!chosen) {
         std::cerr << "[MediaFoundationDriver] No compatible media type found (L8 or NV12)." << std::endl;
         return false;
     }
+    if (chosen->fps + 0.5 < config_.targetFps) {
+        spdlog::warn("[MediaFoundationDriver] No {}x{} L8/NV12 mode reaches {} fps; "
+                     "using {:.1f} fps. The strobe timing model assumes {} fps.",
+                     REQUESTED_WIDTH, REQUESTED_HEIGHT, config_.targetFps, chosen->fps,
+                     config_.targetFps);
+    }
+
+    ComPtr<IMFMediaType> pSelectedType;
+    hr = sourceReader_->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+                                           chosen->index, &pSelectedType);
+    if (FAILED(hr) || !pSelectedType) return false;
+    isNV12_ = (chosen->subtype == MFVideoFormat_NV12);
 
     hr = sourceReader_->SetCurrentMediaType(
         MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, pSelectedType.Get()
     );
     if (FAILED(hr)) return false;
+
+    // Read the rate back from the type the reader actually settled on
+    negotiatedFps_ = chosen->fps;
+    ComPtr<IMFMediaType> pCurrent;
+    if (SUCCEEDED(sourceReader_->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &pCurrent))) {
+        UINT32 num = 0, den = 0;
+        if (SUCCEEDED(MFGetAttributeRatio(pCurrent.Get(), MF_MT_FRAME_RATE, &num, &den)) && den > 0) {
+            negotiatedFps_ = static_cast<double>(num) / den;
+        }
+    }
+    spdlog::info("[MediaFoundationDriver] Selected {} {}x{} @ {:.1f} fps (requested {} fps)",
+                 subtypeName(chosen->subtype), chosen->width, chosen->height,
+                 negotiatedFps_, config_.targetFps);
 
     // -------------------------------------------------------------------------
     // Extract frame properties
@@ -543,32 +568,195 @@ bool MediaFoundationDriver::grabRawFrame(cv::Mat& destination) {
 // =============================================================================
 
 void MediaFoundationDriver::setHardwareExposure(int microseconds) {
-    if (!mediaSource_ || microseconds < 0) return;
+    if (!cameraControl_ || microseconds < 0) return;
 
-    // Strategy: Use IAMCameraControl for standard UVC exposure control.
-    // UVC spec defines exposure in log-base-2 seconds:
-    //   value = log2(exposure_seconds)
-    //   e.g., -15 ≈ 30µs, -14 ≈ 61µs, -13 ≈ 122µs, -10 ≈ 976µs
-    ComPtr<IAMCameraControl> cameraControl;
-    HRESULT hr = mediaSource_->QueryInterface(IID_PPV_ARGS(&cameraControl));
-    if (FAILED(hr)) return;
+    // UVC CameraControl_Exposure is log2(seconds): -9 = 1953 us, -7 = 7812 us.
+    // Round to the nearest step (not floor) and clamp to what the device reports.
+    long value = CameraConfig::exposureUsToLog2(microseconds);
+    if (value < exposureLog2Min_) value = exposureLog2Min_;
+    if (value > exposureLog2Max_) value = exposureLog2Max_;
 
-    // Convert microseconds to log2 seconds
-    // exposure_seconds = microseconds * 1e-6
-    // value = floor(log2(exposure_seconds)) = floor(log2(microseconds) - log2(1e6))
-    // log2(1e6) ≈ 19.93
-    long value;
-    if (microseconds <= 0) {
-        value = -15;  // Minimum exposure (~30µs)
-    } else {
-        double log2Val = std::log2(static_cast<double>(microseconds)) - 19.931568;
-        value = static_cast<long>(std::floor(log2Val));
-        // Clamp to reasonable UVC range
-        if (value < -15) value = -15;
-        if (value > -1)  value = -1;
+    HRESULT hr = cameraControl_->Set(CameraControl_Exposure, value, CameraControl_Flags_Manual);
+    if (FAILED(hr)) {
+        spdlog::warn("[MediaFoundationDriver] Exposure set failed (HR=0x{:08X})",
+                     static_cast<unsigned long>(hr));
+        return;
     }
 
-    cameraControl->Set(CameraControl_Exposure, value, CameraControl_Flags_Manual);
+    long applied = value, flags = 0;
+    if (SUCCEEDED(cameraControl_->Get(CameraControl_Exposure, &applied, &flags))) {
+        value = applied;
+    }
+    appliedExposureUs_ = CameraConfig::exposureLog2ToUs(static_cast<int>(value));
+    spdlog::info("[MediaFoundationDriver] Exposure requested {} us -> applied {} us (log2 {})",
+                 microseconds, appliedExposureUs_, value);
+}
+
+void MediaFoundationDriver::setHardwareGain(int gain) {
+    if (!procAmp_) return;
+    long value = static_cast<long>(gain);
+    if (value < gainMin_) value = gainMin_;
+    if (value > gainMax_) value = gainMax_;
+
+    HRESULT hr = procAmp_->Set(VideoProcAmp_Gain, value, VideoProcAmp_Flags_Manual);
+    if (FAILED(hr)) {
+        spdlog::warn("[MediaFoundationDriver] Gain set failed (HR=0x{:08X})",
+                     static_cast<unsigned long>(hr));
+        return;
+    }
+    long applied = value, flags = 0;
+    if (SUCCEEDED(procAmp_->Get(VideoProcAmp_Gain, &applied, &flags))) {
+        value = applied;
+    }
+    appliedGain_ = static_cast<int>(value);
+    spdlog::info("[MediaFoundationDriver] Gain requested {} -> applied {}", gain, appliedGain_);
+}
+
+void MediaFoundationDriver::setHardwareBrightness(int level) {
+    if (!procAmp_) return;
+    long value = static_cast<long>(level);
+    if (value < brightnessMin_) value = brightnessMin_;
+    if (value > brightnessMax_) value = brightnessMax_;
+
+    HRESULT hr = procAmp_->Set(VideoProcAmp_Brightness, value, VideoProcAmp_Flags_Manual);
+    if (FAILED(hr)) {
+        spdlog::warn("[MediaFoundationDriver] Brightness set failed (HR=0x{:08X})",
+                     static_cast<unsigned long>(hr));
+        return;
+    }
+    spdlog::info("[MediaFoundationDriver] Brightness (black level) set to {}", value);
+}
+
+void MediaFoundationDriver::setAutoExposure(bool enabled) {
+    if (!cameraControl_) return;
+    // The Manual/Auto flag rides along with a value; keep whatever is current.
+    long value = 0, flags = 0;
+    if (FAILED(cameraControl_->Get(CameraControl_Exposure, &value, &flags))) {
+        value = exposureLog2Max_;
+    }
+    HRESULT hr = cameraControl_->Set(CameraControl_Exposure, value,
+                                     enabled ? CameraControl_Flags_Auto : CameraControl_Flags_Manual);
+    if (FAILED(hr)) {
+        spdlog::warn("[MediaFoundationDriver] Auto-exposure {} failed (HR=0x{:08X})",
+                     enabled ? "enable" : "disable", static_cast<unsigned long>(hr));
+    }
+}
+
+void MediaFoundationDriver::setAutoGain(bool enabled) {
+    if (!procAmp_) return;
+    long value = 0, flags = 0;
+    if (FAILED(procAmp_->Get(VideoProcAmp_Gain, &value, &flags))) {
+        value = gainMin_;
+    }
+    HRESULT hr = procAmp_->Set(VideoProcAmp_Gain, value,
+                               enabled ? VideoProcAmp_Flags_Auto : VideoProcAmp_Flags_Manual);
+    if (FAILED(hr)) {
+        // Many UVC cameras have no auto-gain flag at all; that is fine.
+        spdlog::debug("[MediaFoundationDriver] Auto-gain {} not supported (HR=0x{:08X})",
+                      enabled ? "enable" : "disable", static_cast<unsigned long>(hr));
+    }
+}
+
+// =============================================================================
+// Control interface caching / startup configuration
+// =============================================================================
+
+void MediaFoundationDriver::cacheControlInterfaces() {
+    if (!mediaSource_) return;
+
+    HRESULT hr = mediaSource_->QueryInterface(IID_PPV_ARGS(&cameraControl_));
+    if (SUCCEEDED(hr) && cameraControl_) {
+        long mn = 0, mx = 0, step = 0, def = 0, flags = 0;
+        if (SUCCEEDED(cameraControl_->GetRange(CameraControl_Exposure, &mn, &mx, &step, &def, &flags))) {
+            exposureLog2Min_ = mn;
+            exposureLog2Max_ = mx;
+            spdlog::info("[MediaFoundationDriver] Exposure range: log2 {}..{} ({}..{} us), default {}",
+                         mn, mx, CameraConfig::exposureLog2ToUs(static_cast<int>(mn)),
+                         CameraConfig::exposureLog2ToUs(static_cast<int>(mx)), def);
+        }
+    } else {
+        spdlog::warn("[MediaFoundationDriver] IAMCameraControl unavailable; exposure cannot be set.");
+    }
+
+    hr = mediaSource_->QueryInterface(IID_PPV_ARGS(&procAmp_));
+    if (SUCCEEDED(hr) && procAmp_) {
+        long mn = 0, mx = 0, step = 0, def = 0, flags = 0;
+        if (SUCCEEDED(procAmp_->GetRange(VideoProcAmp_Gain, &mn, &mx, &step, &def, &flags))) {
+            gainMin_ = mn;
+            gainMax_ = mx;
+            spdlog::info("[MediaFoundationDriver] Gain range: {}..{}, default {}", mn, mx, def);
+        }
+        if (SUCCEEDED(procAmp_->GetRange(VideoProcAmp_Brightness, &mn, &mx, &step, &def, &flags))) {
+            brightnessMin_ = mn;
+            brightnessMax_ = mx;
+            spdlog::info("[MediaFoundationDriver] Brightness range: {}..{}, default {}", mn, mx, def);
+        }
+    } else {
+        spdlog::warn("[MediaFoundationDriver] IAMVideoProcAmp unavailable; gain/brightness cannot be set.");
+    }
+}
+
+void MediaFoundationDriver::applyStartupConfig() {
+    applyCameraConfig(config_);
+    spdlog::info("[MediaFoundationDriver] Device {} configured: exposure {} us, gain {}, {:.1f} fps",
+                 deviceIndex_, appliedExposureUs_, appliedGain_, negotiatedFps_);
+}
+
+// =============================================================================
+// Native media type enumeration / selection
+// =============================================================================
+
+std::vector<MediaFoundationDriver::MediaTypeInfo>
+MediaFoundationDriver::enumerateNativeMediaTypes() const {
+    std::vector<MediaTypeInfo> types;
+    if (!sourceReader_) return types;
+
+    ComPtr<IMFMediaType> pType;
+    for (DWORD i = 0;
+         SUCCEEDED(sourceReader_->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, i, &pType));
+         ++i, pType.Reset()) {
+        GUID major = GUID_NULL;
+        pType->GetGUID(MF_MT_MAJOR_TYPE, &major);
+        if (major != MFMediaType_Video) continue;
+
+        MediaTypeInfo info;
+        info.index = i;
+        pType->GetGUID(MF_MT_SUBTYPE, &info.subtype);
+        MFGetAttributeSize(pType.Get(), MF_MT_FRAME_SIZE, &info.width, &info.height);
+        UINT32 num = 0, den = 0;
+        if (SUCCEEDED(MFGetAttributeRatio(pType.Get(), MF_MT_FRAME_RATE, &num, &den)) && den > 0) {
+            info.fps = static_cast<double>(num) / den;
+        }
+        info.usable = (info.subtype == MFVideoFormat_L8 || info.subtype == MFVideoFormat_NV12);
+        types.push_back(info);
+    }
+    return types;
+}
+
+const MediaFoundationDriver::MediaTypeInfo*
+MediaFoundationDriver::selectMediaType(const std::vector<MediaTypeInfo>& types,
+                                       uint32_t width, uint32_t height, int targetFps) {
+    // Rank: usable subtype, then the requested size, then a rate that meets the
+    // target (closest from above), then L8 over NV12, then the highest rate.
+    const MediaTypeInfo* best = nullptr;
+    auto rank = [&](const MediaTypeInfo& t) {
+        const bool sizeOk   = (t.width == width && t.height == height);
+        const bool meetsFps = (t.fps + 0.5 >= targetFps);
+        const bool isL8     = (t.subtype == MFVideoFormat_L8);
+        // Closest-from-above when the target is met; otherwise higher is better.
+        const double fpsKey = meetsFps ? -(t.fps - targetFps) : t.fps;
+        return std::make_tuple(sizeOk, meetsFps, isL8, fpsKey);
+    };
+    for (const auto& t : types) {
+        if (!t.usable) continue;
+        if (!best || rank(t) > rank(*best)) best = &t;
+    }
+    if (best && (best->width != width || best->height != height)) {
+        spdlog::warn("[MediaFoundationDriver] No {}x{} L8/NV12 mode advertised; using {}x{}. "
+                     "Upstream buffers are sized for {}x{}.",
+                     width, height, best->width, best->height, width, height);
+    }
+    return best;
 }
 
 // =============================================================================
@@ -585,12 +773,6 @@ void MediaFoundationDriver::injectImmediateRegisterWrite(uint16_t reg, uint8_t v
     // Disabled: The standard UVC firmware on this Arducam OV9281 bridge does not 
     // expose a UVC Extension Unit for I2C pass-through. KsProperty requests will 
     // fail with 0x80070492 (ERROR_PROP_NOT_FOUND).
-}
-
-void MediaFoundationDriver::configureTriggerAndExposureSettings() {
-    // Disabled: Standard UVC driver handles exposure. We cannot write I2C registers 
-    // via UVC on this hardware, so we rely on the default firmware state.
-    spdlog::info("[MediaFoundationDriver] Hardware register configuration skipped (Unsupported on this UVC bridge).");
 }
 
 #endif

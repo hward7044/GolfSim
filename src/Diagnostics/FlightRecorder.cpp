@@ -184,6 +184,7 @@ void FlightRecorder::processStreamTask(const SaveTask& task) {
     jMeta["sessionType"] = "stream";
     jMeta["timestamp"] = task.sessionTimestamp;
     jMeta["frameCount"] = task.frames.size();
+    jMeta["session"] = sessionInfo_;
 
     nlohmann::json jFrames = nlohmann::json::array();
 
@@ -197,9 +198,13 @@ void FlightRecorder::processStreamTask(const SaveTask& task) {
 
         if (!f.leftFrame.empty()) {
             cv::imwrite((rawPath / filenameLeft).string(), f.leftFrame);
+            cv::imwrite((annotatedPath / filenameLeft).string(),
+                        annotateFrame(f.leftFrame, f.triggerDiag, f.leftVisionDiag, f.triangulatedBalls, true));
         }
         if (!f.rightFrame.empty()) {
             cv::imwrite((rawPath / filenameRight).string(), f.rightFrame);
+            cv::imwrite((annotatedPath / filenameRight).string(),
+                        annotateFrame(f.rightFrame, f.triggerDiag, f.rightVisionDiag, f.triangulatedBalls, false));
         }
 
         nlohmann::json jFrame;
@@ -208,6 +213,8 @@ void FlightRecorder::processStreamTask(const SaveTask& task) {
         jFrame["rawLeft"] = filenameLeft;
         jFrame["rawRight"] = filenameRight;
         jFrame["triggerDiag"] = f.triggerDiag;
+        jFrame["leftVision"] = f.leftVisionDiag;
+        jFrame["rightVision"] = f.rightVisionDiag;
 
         jFrames.push_back(jFrame);
     }
@@ -224,6 +231,150 @@ void FlightRecorder::processStreamTask(const SaveTask& task) {
     }
 
     enforceLimit();
+}
+
+// =============================================================================
+// Overlay drawing — one routine for both cameras and both session types
+// =============================================================================
+
+cv::Mat FlightRecorder::annotateFrame(const cv::Mat& gray,
+                                      const nlohmann::json& triggerDiag,
+                                      const nlohmann::json& visionDiag,
+                                      const std::vector<Ball3D>& balls3D,
+                                      bool isLeft) {
+    cv::Mat ann;
+    if (gray.channels() == 1) {
+        cv::cvtColor(gray, ann, cv::COLOR_GRAY2BGR);
+    } else {
+        ann = gray.clone();
+    }
+
+    const cv::Scalar green(0, 255, 0), red(0, 0, 255), blue(255, 0, 0),
+                     orange(0, 165, 255), cyan(255, 255, 0), yellow(0, 255, 255);
+
+    auto rectFrom = [](const nlohmann::json& j, cv::Rect& out) {
+        if (!j.is_array() || j.size() != 4) return false;
+        out = cv::Rect(j[0].get<int>(), j[1].get<int>(), j[2].get<int>(), j[3].get<int>());
+        return true;
+    };
+
+    // --- Trigger state (left camera carries the trigger's view) ---
+    if (isLeft && triggerDiag.is_object()) {
+        std::string st = triggerDiag.value("state", "");
+        if (!st.empty()) {
+            std::string text = "Trigger: " + st;
+            if (triggerDiag.contains("stabilityCounter")) {
+                text += " (" + std::to_string(triggerDiag.value("stabilityCounter", 0)) + "/" +
+                        std::to_string(triggerDiag.value("lockFrameCount", 0)) + ")";
+            } else if (triggerDiag.contains("searchStabilityCounter")) {
+                text += " (stable " + std::to_string(triggerDiag.value("searchStabilityCounter", 0)) + ")";
+            }
+            if (triggerDiag.contains("matchScore")) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), " match %.2f", triggerDiag.value("matchScore", 0.0f));
+                text += buf;
+            }
+            if (triggerDiag.contains("disparityPx")) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), " | dx %.0f dy %.0f px",
+                         triggerDiag.value("disparityPx", 0.0), triggerDiag.value("verticalOffsetPx", 0.0));
+                text += buf;
+            }
+            cv::putText(ann, text, cv::Point(20, ann.rows - 20), cv::FONT_HERSHEY_SIMPLEX, 0.5, orange, 1);
+        }
+
+        cv::Rect lbox;
+        if (triggerDiag.contains("lockedBallBox") && rectFrom(triggerDiag["lockedBallBox"], lbox) && lbox.width > 0) {
+            cv::rectangle(ann, lbox, cyan, 2); // Cyan locked ball
+        }
+        cv::Rect gate;
+        if (triggerDiag.contains("gateROI") && rectFrom(triggerDiag["gateROI"], gate)) {
+            cv::rectangle(ann, gate, orange, 2);
+        }
+    }
+
+    // --- Vision: dot clusters (candidates) and individual dots ---
+    // The trigger publishes the finder's view too, so a stream recording made
+    // before any shot still shows what was detected.
+    const nlohmann::json* vision = &visionDiag;
+    if ((!vision->is_object() || !vision->contains("candidates")) && triggerDiag.is_object()) {
+        const char* key = isLeft ? "leftDots" : "rightDots";
+        if (triggerDiag.contains(key)) {
+            vision = &triggerDiag[key];
+        } else if (triggerDiag.contains("dots")) {
+            vision = &triggerDiag["dots"];
+        }
+    }
+
+    if (vision->is_object() && vision->contains("dots")) {
+        for (const auto& dJ : (*vision)["dots"]) {
+            auto cJ = dJ["centroid"];
+            if (!cJ.is_array() || cJ.size() != 2) continue;
+            cv::Point centre(static_cast<int>(std::lround(cJ[0].get<double>())),
+                             static_cast<int>(std::lround(cJ[1].get<double>())));
+            if (dJ.value("accepted", false)) {
+                cv::circle(ann, centre, 4, blue, 1);
+            } else {
+                cv::Rect box;
+                if (dJ.contains("boundingBox") && rectFrom(dJ["boundingBox"], box)) {
+                    cv::rectangle(ann, box, red, 1);
+                } else {
+                    cv::drawMarker(ann, centre, red, cv::MARKER_TILTED_CROSS, 6, 1);
+                }
+            }
+        }
+    }
+
+    if (vision->is_object() && vision->contains("candidates")) {
+        int noiseCount = 0;
+        for (const auto& candJ : (*vision)["candidates"]) {
+            bool accepted = candJ.value("accepted", false);
+            cv::Rect bb;
+            auto cenJ = candJ["centroid"];
+            if (!rectFrom(candJ["boundingBox"], bb) || !cenJ.is_array() || cenJ.size() != 2) continue;
+            cv::Point2d cen(cenJ[0].get<double>(), cenJ[1].get<double>());
+
+            if (accepted) {
+                cv::rectangle(ann, bb, green, 2);
+                cv::line(ann, cv::Point2d(cen.x - 5, cen.y), cv::Point2d(cen.x + 5, cen.y), green, 2);
+                cv::line(ann, cv::Point2d(cen.x, cen.y - 5), cv::Point2d(cen.x, cen.y + 5), green, 2);
+
+                std::string lbl;
+                if (candJ.contains("dotCount")) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "Ball (%d dots, %.0f px)",
+                             candJ.value("dotCount", 0), candJ.value("spreadPx", 0.0));
+                    lbl = buf;
+                } else {
+                    lbl = "Ball (A:" + std::to_string((int)candJ.value("area", 0.0)) + ")";
+                }
+                cv::putText(ann, lbl, cv::Point(bb.x, bb.y - 5), cv::FONT_HERSHEY_SIMPLEX, 0.4, green, 1);
+
+                if (candJ.contains("markers")) {
+                    for (const auto& mJ : candJ["markers"]) {
+                        if (mJ.is_array() && mJ.size() == 2) {
+                            cv::circle(ann, cv::Point2d(mJ[0].get<double>(), mJ[1].get<double>()), 2, blue, -1);
+                        }
+                    }
+                }
+            } else if (noiseCount < 15) {
+                noiseCount++;
+                cv::rectangle(ann, bb, red, 1);
+                std::string lbl = "Noise: " + candJ.value("reason", std::string());
+                cv::putText(ann, lbl, cv::Point(bb.x, bb.y - 5), cv::FONT_HERSHEY_SIMPLEX, 0.4, red, 1);
+            }
+        }
+    }
+
+    // --- Triangulated 3D coordinate ---
+    if (!balls3D.empty()) {
+        const auto& ball3D = balls3D[0];
+        std::ostringstream spaceOss;
+        spaceOss << "3D: (" << std::fixed << std::setprecision(3) << ball3D.centroid.x() << ", "
+                 << ball3D.centroid.y() << ", " << ball3D.centroid.z() << ")";
+        cv::putText(ann, spaceOss.str(), cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 0.6, yellow, 2);
+    }
+    return ann;
 }
 
 void FlightRecorder::processSaveTask(const SaveTask& task) {
@@ -255,7 +406,8 @@ void FlightRecorder::processSaveTask(const SaveTask& task) {
     nlohmann::json jMeta;
     jMeta["shotId"] = shotId;
     jMeta["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-    
+    jMeta["session"] = sessionInfo_;
+
     // Kinematics details
     jMeta["kinematics"] = {
         {"ballSpeed_mph", task.launchData.ballSpeed.value()},
@@ -282,151 +434,15 @@ void FlightRecorder::processSaveTask(const SaveTask& task) {
         }
 
         // Draw annotations
-        cv::Mat annLeft, annRight;
         if (!rFrame.leftFrame.empty()) {
-            cv::cvtColor(rFrame.leftFrame, annLeft, cv::COLOR_GRAY2BGR);
-            
-            // Draw trigger box (teeROI in orange, locked ball in cyan if available)
-            if (rFrame.triggerDiag.contains("teeROI")) {
-                auto roiJ = rFrame.triggerDiag["teeROI"];
-                if (roiJ.is_array() && roiJ.size() == 4) {
-                    cv::Rect roi(roiJ[0], roiJ[1], roiJ[2], roiJ[3]);
-                    cv::rectangle(annLeft, roi, cv::Scalar(0, 165, 255), 2); // Orange tee ROI
-                    
-                    std::string st = rFrame.triggerDiag.value("state", "TRIGGER");
-                    int count = rFrame.triggerDiag.value("stabilityCounter", 0);
-                    int maxCount = rFrame.triggerDiag.value("lockFrameCount", 30);
-                    float score = rFrame.triggerDiag.value("matchScore", 1.0f);
-                    
-                    char scoreBuf[32];
-                    snprintf(scoreBuf, sizeof(scoreBuf), " (Match: %.2f)", score);
-                    std::string triggerText = st + " (" + std::to_string(count) + "/" + std::to_string(maxCount) + ")" + scoreBuf;
-                    cv::putText(annLeft, triggerText, cv::Point(roi.x, roi.y - 10),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 165, 255), 1);
-                }
-
-                if (rFrame.triggerDiag.contains("lockedBallBox")) {
-                    auto lboxJ = rFrame.triggerDiag["lockedBallBox"];
-                    if (lboxJ.is_array() && lboxJ.size() == 4 && lboxJ[2].get<int>() > 0) {
-                        cv::Rect lbox(lboxJ[0], lboxJ[1], lboxJ[2], lboxJ[3]);
-                        cv::rectangle(annLeft, lbox, cv::Scalar(255, 255, 0), 2); // Cyan locked ball
-                    }
-                }
-            } else if (rFrame.triggerDiag.contains("gateROI")) {
-                auto roiJ = rFrame.triggerDiag["gateROI"];
-                if (roiJ.is_array() && roiJ.size() == 4) {
-                    cv::Rect roi(roiJ[0], roiJ[1], roiJ[2], roiJ[3]);
-                    cv::rectangle(annLeft, roi, cv::Scalar(0, 165, 255), 2);
-                    std::string triggerText = "Gate Pixels: " + std::to_string(rFrame.triggerDiag.value("nonZeroCount", 0)) +
-                                              " / " + std::to_string(rFrame.triggerDiag.value("minBallPixels", 0));
-                    cv::putText(annLeft, triggerText, cv::Point(roi.x, roi.y - 10),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 165, 255), 1);
-                }
-            }
-            
-            // Draw candidates
-            if (rFrame.leftVisionDiag.contains("candidates")) {
-                int noiseCountLeft = 0;
-                for (const auto& candJ : rFrame.leftVisionDiag["candidates"]) {
-                    bool accepted = candJ.value("accepted", false);
-                    auto bbJ = candJ["boundingBox"];
-                    auto cenJ = candJ["centroid"];
-                    if (bbJ.is_array() && bbJ.size() == 4 && cenJ.is_array() && cenJ.size() == 2) {
-                        cv::Rect bb(bbJ[0], bbJ[1], bbJ[2], bbJ[3]);
-                        cv::Point2d cen(cenJ[0], cenJ[1]);
-                        
-                        if (accepted) {
-                            cv::rectangle(annLeft, bb, cv::Scalar(0, 255, 0), 2);
-                            cv::line(annLeft, cv::Point2d(cen.x - 5, cen.y), cv::Point2d(cen.x + 5, cen.y), cv::Scalar(0, 255, 0), 2);
-                            cv::line(annLeft, cv::Point2d(cen.x, cen.y - 5), cv::Point2d(cen.x, cen.y + 5), cv::Scalar(0, 255, 0), 2);
-                            
-                            std::string lbl = "Ball (A:" + std::to_string((int)candJ.value("area", 0.0)) + ")";
-                            cv::putText(annLeft, lbl, cv::Point(bb.x, bb.y - 5),
-                                        cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
-
-                            // Draw markers
-                            if (candJ.contains("markers")) {
-                                for (const auto& mJ : candJ["markers"]) {
-                                    if (mJ.is_array() && mJ.size() == 2) {
-                                        cv::circle(annLeft, cv::Point2d(mJ[0], mJ[1]), 2, cv::Scalar(255, 0, 0), -1);
-                                    }
-                                }
-                            }
-                        } else if (noiseCountLeft < 15) {
-                            noiseCountLeft++;
-                            cv::rectangle(annLeft, bb, cv::Scalar(0, 0, 255), 1);
-                            std::string lbl = "Noise: " + candJ.value("reason", "");
-                            cv::putText(annLeft, lbl, cv::Point(bb.x, bb.y - 5),
-                                        cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 255), 1);
-                        }
-                    }
-                }
-            }
-
-            // Draw triangulated 3D coordinate on left overlay if present
-            if (!rFrame.triangulatedBalls.empty()) {
-                const auto& ball3D = rFrame.triangulatedBalls[0];
-                std::ostringstream spaceOss;
-                spaceOss << "3D: (" << std::fixed << std::setprecision(3) << ball3D.centroid.x() << ", "
-                         << ball3D.centroid.y() << ", " << ball3D.centroid.z() << ")";
-                cv::putText(annLeft, spaceOss.str(), cv::Point(20, 40),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
-            }
-            cv::imwrite((annPath / ("left_" + filename)).string(), annLeft);
+            cv::imwrite((annPath / ("left_" + filename)).string(),
+                        annotateFrame(rFrame.leftFrame, rFrame.triggerDiag, rFrame.leftVisionDiag,
+                                      rFrame.triangulatedBalls, true));
         }
-
         if (!rFrame.rightFrame.empty()) {
-            cv::cvtColor(rFrame.rightFrame, annRight, cv::COLOR_GRAY2BGR);
-            
-            // Draw candidates
-            if (rFrame.rightVisionDiag.contains("candidates")) {
-                int noiseCountRight = 0;
-                for (const auto& candJ : rFrame.rightVisionDiag["candidates"]) {
-                    bool accepted = candJ.value("accepted", false);
-                    auto bbJ = candJ["boundingBox"];
-                    auto cenJ = candJ["centroid"];
-                    if (bbJ.is_array() && bbJ.size() == 4 && cenJ.is_array() && cenJ.size() == 2) {
-                        cv::Rect bb(bbJ[0], bbJ[1], bbJ[2], bbJ[3]);
-                        cv::Point2d cen(cenJ[0], cenJ[1]);
-                        
-                        if (accepted) {
-                            cv::rectangle(annRight, bb, cv::Scalar(0, 255, 0), 2);
-                            cv::line(annRight, cv::Point2d(cen.x - 5, cen.y), cv::Point2d(cen.x + 5, cen.y), cv::Scalar(0, 255, 0), 2);
-                            cv::line(annRight, cv::Point2d(cen.x, cen.y - 5), cv::Point2d(cen.x, cen.y + 5), cv::Scalar(0, 255, 0), 2);
-                            
-                            std::string lbl = "Ball (A:" + std::to_string((int)candJ.value("area", 0.0)) + ")";
-                            cv::putText(annRight, lbl, cv::Point(bb.x, bb.y - 5),
-                                        cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
-
-                            // Draw markers
-                            if (candJ.contains("markers")) {
-                                for (const auto& mJ : candJ["markers"]) {
-                                    if (mJ.is_array() && mJ.size() == 2) {
-                                        cv::circle(annRight, cv::Point2d(mJ[0], mJ[1]), 2, cv::Scalar(255, 0, 0), -1);
-                                    }
-                                }
-                            }
-                        } else if (noiseCountRight < 15) {
-                            noiseCountRight++;
-                            cv::rectangle(annRight, bb, cv::Scalar(0, 0, 255), 1);
-                            std::string lbl = "Noise: " + candJ.value("reason", "");
-                            cv::putText(annRight, lbl, cv::Point(bb.x, bb.y - 5),
-                                        cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 255), 1);
-                        }
-                    }
-                }
-            }
-
-            // Draw triangulated 3D coordinate on right overlay if present
-            if (!rFrame.triangulatedBalls.empty()) {
-                const auto& ball3D = rFrame.triangulatedBalls[0];
-                std::ostringstream spaceOss;
-                spaceOss << "3D: (" << std::fixed << std::setprecision(3) << ball3D.centroid.x() << ", "
-                         << ball3D.centroid.y() << ", " << ball3D.centroid.z() << ")";
-                cv::putText(annRight, spaceOss.str(), cv::Point(20, 40),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
-            }
-            cv::imwrite((annPath / ("right_" + filename)).string(), annRight);
+            cv::imwrite((annPath / ("right_" + filename)).string(),
+                        annotateFrame(rFrame.rightFrame, rFrame.triggerDiag, rFrame.rightVisionDiag,
+                                      rFrame.triangulatedBalls, false));
         }
 
         nlohmann::json jFrame;

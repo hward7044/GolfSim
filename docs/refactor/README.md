@@ -16,6 +16,7 @@ This directory contains the detailed engineering specifications, mathematical pr
 | **[06](06_Architecture_Modularity.md)** | **Architecture Modularity & Application Decoupling** | **PENDING** | Plan for modularizing `main.cpp`, extracting `ReplayViewer` and `CameraDebugger`, centralized `AppConfig`, and headless `PlaybackCameraNode` for offline simulation. |
 | **[07](07_Test_Infrastructure.md)** | **Testing Infrastructure & CTest Integration** | **COMPLETED** | Standalone `GolfSimTests` runner over a `golfsim_core` static library, CTest with one entry per case, release-safe `TEST_ASSERT`/`TEST_NEAR`, all test side effects sandboxed, verification code removed from `main()` (`--version` instead), CTest guards that keep test code out of `src/`, and a Clang/`llvm-cov` coverage gate (`GOLFSIM_COVERAGE`) with a ratcheting baseline. Execution plan and coverage roadmap: [07_Test_Infrastructure_Plan.md](07_Test_Infrastructure_Plan.md). |
 | **[08](08_Linux_V4L2_Driver.md)** | **Linux V4L2 Camera Driver** | **COMPLETED** | Raw V4L2 MMAP driver mirroring the Media Foundation API behind a `PlatformCameraDriver` alias. GREY → NV12 → YUYV negotiation, manual UVC exposure (100 µs units, 10 ms default), capture-node filtering for index mapping, `STREAMOFF`-based shutdown handshake, and kernel frame timestamps plumbed into `FrameSet`. |
+| **[09](09_Exposure_Gain_Config_And_Dot_Cluster_Detection.md)** | **Camera Exposure/Gain Configuration & Dot-Cluster Ball Detection** | **IMPLEMENTED** | `cameraExposureUs` is dead config and Windows has no gain control, so production runs at UVC defaults. Plan: typed `CameraConfig` loaded from `config/golfsim.json`, `IAMVideoProcAmp` / `V4L2_CID_GAIN` gain, round-to-nearest UVC log2 exposure with readback. Detector is silhouette-based and cannot see a dots-only ball (measured cap is ~0.45x ball diameter); replace with `DotClusterFinder` shared by tracker and triggers, full-frame search (ROI removed), aspect-ratio rejection of specular bars. Exposure fixed at 7812 us to hold the 3-pulse 300 Hz train; drivers to negotiate 100 FPS explicitly. |
 
 ---
 
@@ -28,6 +29,8 @@ graph TD
     Phase3 --> Phase4["04: Stereo Math & Principal Vector Sorting (Done)"]
     Phase4 --> Phase5["07: Standalone Test Suite & CTest (Done)"]
     Phase5 --> Phase6["06: Modular Architecture & main.cpp Refactor (Next)"]
+    Phase5 --> Phase7["09: Exposure/Gain Config & Dot-Cluster Detection (Done; awaiting rig sweep)"]
+    Phase7 --> Phase6
     Phase4 --> Phase4b["08: Linux V4L2 Driver (Done)"]
     Phase4b --> Phase5
     
@@ -38,5 +41,6 @@ graph TD
     style Phase4b fill:#d4edda,stroke:#28a745,stroke-width:2px;
     style Phase5 fill:#d4edda,stroke:#28a745,stroke-width:2px;
     style Phase6 fill:#fff3cd,stroke:#ffc107,stroke-width:2px;
+    style Phase7 fill:#d4edda,stroke:#28a745,stroke-width:2px;
 ```
 

@@ -7,17 +7,16 @@
 #include <spdlog/spdlog.h>
 
 StereoBallTrackerTrigger::StereoBallTrackerTrigger(
-    StereoCalibration calib, cv::Rect searchRoiLeft, cv::Rect searchRoiRight,
-    double minRadius, double maxRadius, double minCirc, int thresh,
-    double epipolarTol, int armedWinSize, double max3DDist,
+    StereoCalibration calib, DotClusterConfig dotConfig,
+    double nominalBallRadiusPx, double epipolarTol, double disparityMin,
+    double disparityMax, int armedWinSize, double max3DDist,
     int searchLockFrames, int graceMax, double impactVelThresh,
-    double motionDispThresh, double minArea, double maxArea)
+    double motionDispThresh)
     : calib_(calib), state_(StereoTriggerState::SEARCHING),
-      searchRoiLeft_(searchRoiLeft), searchRoiRight_(searchRoiRight),
-      minBallRadiusPx_(minRadius), maxBallRadiusPx_(maxRadius),
-      minBallArea_(minArea), maxBallArea_(maxArea), minCircularity_(minCirc),
-      ballThreshold_(thresh), epipolarTolerancePx_(epipolarTol),
-      disparityMinPx_(10.0), disparityMaxPx_(400.0), armedWindowSize_(armedWinSize),
+      finder_(dotConfig, nominalBallRadiusPx),
+      nominalBallRadiusPx_(nominalBallRadiusPx),
+      epipolarTolerancePx_(epipolarTol), disparityMinPx_(disparityMin),
+      disparityMaxPx_(disparityMax), armedWindowSize_(armedWinSize),
       max3DDistanceMeters_(max3DDist), minZDistanceMeters_(0.20),
       searchLockFrameCount_(searchLockFrames), searchStabilityCounter_(0),
       lastSearchCandidate3D_(0.0, 0.0, 0.0),
@@ -49,7 +48,9 @@ StereoBallTrackerTrigger::StereoBallTrackerTrigger(
                   1000.0, 400.0, 0.0, 0.0, 0.0, 1.0, 0.0});
   }
 
-  spdlog::info("[StereoTrigger] State initialized: SEARCHING for ball...");
+  spdlog::info("[StereoTrigger] State initialized: SEARCHING for ball "
+               "(dot-cluster finder, intensity threshold {}, full frame)",
+               finder_.config().intensityThreshold);
 
   latestDiag_ = {{"state", "SEARCHING"},
                  {"triggered", false},
@@ -115,74 +116,44 @@ StereoBallTrackerTrigger::project3DToRight(const Eigen::Vector3d &pt3D) {
 }
 
 std::vector<BlobCandidate> StereoBallTrackerTrigger::extractCandidates(
-    const cv::Mat &grayFrame, const cv::Rect &searchROI, const cv::Mat &K,
+    const cv::Mat &grayFrame, DotClusterResult &scratch, const cv::Mat &K,
     const cv::Mat &D, const cv::Mat &R_rect, const cv::Mat &P_rect) {
   std::vector<BlobCandidate> candidates;
   if (grayFrame.empty())
     return candidates;
 
-  cv::Rect safeRoi = searchROI & cv::Rect(0, 0, grayFrame.cols, grayFrame.rows);
-  if (safeRoi.area() <= 0)
-    return candidates;
+  // Every accepted dot cluster is a ball candidate. The finder has already
+  // applied the dot area/aspect and cluster count/spread gates.
+  finder_.find(grayFrame, scratch);
+  candidates.reserve(scratch.clusters.size());
+  for (const auto &cluster : scratch.clusters) {
+    BlobCandidate cand;
+    cand.centroid = cluster.centroid;
+    cand.rectCentroid = rectifyPoint(cluster.centroid, K, D, R_rect, P_rect);
+    cand.boundingRect = cluster.boundingBox;
+    cand.area = cluster.totalArea;
+    // The lit cap, not the ball: both cameras see a similar-sized cluster, so
+    // radius symmetry in the pair score still means something.
+    cand.radius = std::max(cluster.spreadPx / 2.0, 1.0);
+    cand.circularity = 1.0;
+    cand.dotCount = static_cast<int>(cluster.dots.size());
+    candidates.push_back(cand);
+  }
+  return candidates;
+}
 
-  cv::Mat roiFrame = grayFrame(safeRoi);
-  cv::Mat blurred;
-  cv::GaussianBlur(roiFrame, blurred, cv::Size(3, 3), 0);
-
-  // Binary threshold using ballThreshold_ (separates bright ball dome from
-  // carpet background)
-  cv::Mat threshRoi;
-  cv::threshold(blurred, threshRoi, ballThreshold_, 255, cv::THRESH_BINARY);
-
-  std::vector<std::vector<cv::Point>> contours;
-  cv::findContours(threshRoi, contours, cv::RETR_EXTERNAL,
-                   cv::CHAIN_APPROX_SIMPLE);
-
-  for (const auto &contour : contours) {
-    double area = cv::contourArea(contour);
-    if (area < minBallArea_ || area > maxBallArea_)
-      continue;
-
-    cv::Point2f center;
-    float radius = 0.0f;
-    cv::minEnclosingCircle(contour, center, radius);
-
-    if (radius < minBallRadiusPx_ || radius > maxBallRadiusPx_) {
-      continue;
-    }
-
-    double perimeter = cv::arcLength(contour, true);
-    double circularity = 0.0;
-    if (perimeter > 0.0) {
-      circularity = (4.0 * CV_PI * area) / (perimeter * perimeter);
-    }
-
-    if (circularity >= minCircularity_) {
-      cv::Moments m = cv::moments(contour);
-      if (m.m00 > 0.0) {
-        cv::Point2d localCentroid(m.m10 / m.m00, m.m01 / m.m00);
-        cv::Point2d globalCentroid(safeRoi.x + localCentroid.x,
-                                   safeRoi.y + localCentroid.y);
-        cv::Rect localBox = cv::boundingRect(contour);
-        cv::Rect globalBox(safeRoi.x + localBox.x, safeRoi.y + localBox.y,
-                           localBox.width, localBox.height);
-
-        cv::Point2d rectCen =
-            rectifyPoint(globalCentroid, K, D, R_rect, P_rect);
-
-        BlobCandidate cand;
-        cand.centroid = globalCentroid;
-        cand.rectCentroid = rectCen;
-        cand.boundingRect = globalBox;
-        cand.area = area;
-        cand.radius = static_cast<double>(radius);
-        cand.circularity = circularity;
-        candidates.push_back(cand);
-      }
+std::vector<BlobCandidate> StereoBallTrackerTrigger::withinWindow(
+    const std::vector<BlobCandidate> &candidates, const cv::Point2d &center,
+    int windowSize) {
+  const double half = windowSize / 2.0;
+  std::vector<BlobCandidate> inside;
+  for (const auto &c : candidates) {
+    if (std::abs(c.centroid.x - center.x) <= half &&
+        std::abs(c.centroid.y - center.y) <= half) {
+      inside.push_back(c);
     }
   }
-
-  return candidates;
+  return inside;
 }
 
 bool StereoBallTrackerTrigger::checkTrigger(const cv::Mat &leftFrame,
@@ -209,11 +180,10 @@ bool StereoBallTrackerTrigger::checkTrigger(const cv::Mat &leftFrame,
   }
 
   if (state_ == StereoTriggerState::SEARCHING) {
-    auto leftCandidates = extractCandidates(grayL_, searchRoiLeft_, calib_.K_L,
+    auto leftCandidates = extractCandidates(grayL_, resultL_, calib_.K_L,
                                             calib_.D_L, calib_.R_L, calib_.P_L);
-    auto rightCandidates =
-        extractCandidates(grayR_, searchRoiRight_, calib_.K_R, calib_.D_R,
-                          calib_.R_R, calib_.P_R);
+    auto rightCandidates = extractCandidates(grayR_, resultR_, calib_.K_R,
+                                             calib_.D_R, calib_.R_R, calib_.P_R);
 
     const BlobCandidate *bestL = nullptr;
     const BlobCandidate *bestR = nullptr;
@@ -320,12 +290,25 @@ bool StereoBallTrackerTrigger::checkTrigger(const cv::Mat &leftFrame,
 
       if (searchingLogCounter_ % 60 == 1) {
         spdlog::info(
-            "[StereoTrigger] Searching... Candidates found: Left={}, Right={}. "
-            "(Threshold: {}, Radius: {:.0f}-{:.0f}px, Max 3D Distance: {:.2f}m "
-            "/ 3.0ft)",
-            leftCandidates.size(), rightCandidates.size(), ballThreshold_,
-            minBallRadiusPx_, maxBallRadiusPx_, max3DDistanceMeters_);
+            "[StereoTrigger] Searching... Dot clusters found: Left={}, Right={} "
+            "(rejected dots L={}, R={}). Intensity threshold {}, epipolar tol "
+            "{:.0f}px, disparity {:.0f}..{:.0f}px, max 3D distance {:.2f}m",
+            leftCandidates.size(), rightCandidates.size(),
+            resultL_.rejectedDots.size(), resultR_.rejectedDots.size(),
+            finder_.config().intensityThreshold, epipolarTolerancePx_,
+            disparityMinPx_, disparityMaxPx_, max3DDistanceMeters_);
       }
+    }
+
+    // Best pair geometry, so a stream recording shows the measured stereo
+    // offsets even when no pair passed the gates.
+    double bestDisparity = 0.0, bestVerticalOffset = 0.0;
+    if (bestL && bestR) {
+      bestDisparity = bestL->rectCentroid.x - bestR->rectCentroid.x;
+      bestVerticalOffset = bestL->rectCentroid.y - bestR->rectCentroid.y;
+    } else if (!leftCandidates.empty() && !rightCandidates.empty()) {
+      bestDisparity = leftCandidates[0].rectCentroid.x - rightCandidates[0].rectCentroid.x;
+      bestVerticalOffset = leftCandidates[0].rectCentroid.y - rightCandidates[0].rectCentroid.y;
     }
 
     latestDiag_ = {
@@ -338,24 +321,24 @@ bool StereoBallTrackerTrigger::checkTrigger(const cv::Mat &leftFrame,
         {"minPairScore", (minPairScore < 1e8) ? minPairScore : 999.0},
         {"minEpipolarErr",
          (bestPairEpipolarErr < 900.0) ? bestPairEpipolarErr : 999.0},
+        {"disparityPx", bestDisparity},
+        {"verticalOffsetPx", bestVerticalOffset},
         {"cameraDistanceMeters", bestPairDist3D},
         {"lastKnown3D",
-         {lastKnown3DPos_.x(), lastKnown3DPos_.y(), lastKnown3DPos_.z()}}};
+         {lastKnown3DPos_.x(), lastKnown3DPos_.y(), lastKnown3DPos_.z()}},
+        {"leftDots", resultL_.toJson()},
+        {"rightDots", resultR_.toJson()}};
     return false;
 
   } else if (state_ == StereoTriggerState::ARMED) {
-    int halfWin = armedWindowSize_ / 2;
-    cv::Rect winL(static_cast<int>(lastKnownLeft2D_.x) - halfWin,
-                  static_cast<int>(lastKnownLeft2D_.y) - halfWin,
-                  armedWindowSize_, armedWindowSize_);
-    cv::Rect winR(static_cast<int>(lastKnownRight2D_.x) - halfWin,
-                  static_cast<int>(lastKnownRight2D_.y) - halfWin,
-                  armedWindowSize_, armedWindowSize_);
-
-    auto leftCandidates = extractCandidates(grayL_, winL, calib_.K_L,
-                                            calib_.D_L, calib_.R_L, calib_.P_L);
-    auto rightCandidates = extractCandidates(
-        grayR_, winR, calib_.K_R, calib_.D_R, calib_.R_R, calib_.P_R);
+    auto leftCandidates = withinWindow(
+        extractCandidates(grayL_, resultL_, calib_.K_L, calib_.D_L, calib_.R_L,
+                          calib_.P_L),
+        lastKnownLeft2D_, armedWindowSize_);
+    auto rightCandidates = withinWindow(
+        extractCandidates(grayR_, resultR_, calib_.K_R, calib_.D_R, calib_.R_R,
+                          calib_.P_R),
+        lastKnownRight2D_, armedWindowSize_);
 
     bool leftFound = !leftCandidates.empty();
     bool rightFound = !rightCandidates.empty();
@@ -435,18 +418,14 @@ bool StereoBallTrackerTrigger::checkTrigger(const cv::Mat &leftFrame,
     return false;
 
   } else if (state_ == StereoTriggerState::CONFIRMING) {
-    int halfWin = armedWindowSize_ / 2;
-    cv::Rect winL(static_cast<int>(lastKnownLeft2D_.x) - halfWin,
-                  static_cast<int>(lastKnownLeft2D_.y) - halfWin,
-                  armedWindowSize_, armedWindowSize_);
-    cv::Rect winR(static_cast<int>(lastKnownRight2D_.x) - halfWin,
-                  static_cast<int>(lastKnownRight2D_.y) - halfWin,
-                  armedWindowSize_, armedWindowSize_);
-
-    auto leftCandidates = extractCandidates(grayL_, winL, calib_.K_L,
-                                            calib_.D_L, calib_.R_L, calib_.P_L);
-    auto rightCandidates = extractCandidates(
-        grayR_, winR, calib_.K_R, calib_.D_R, calib_.R_R, calib_.P_R);
+    auto leftCandidates = withinWindow(
+        extractCandidates(grayL_, resultL_, calib_.K_L, calib_.D_L, calib_.R_L,
+                          calib_.P_L),
+        lastKnownLeft2D_, armedWindowSize_);
+    auto rightCandidates = withinWindow(
+        extractCandidates(grayR_, resultR_, calib_.K_R, calib_.D_R, calib_.R_R,
+                          calib_.P_R),
+        lastKnownRight2D_, armedWindowSize_);
 
     bool bothFound = (!leftCandidates.empty() && !rightCandidates.empty());
 

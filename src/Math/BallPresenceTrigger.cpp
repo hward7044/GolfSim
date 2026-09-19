@@ -5,20 +5,13 @@
 #include <cmath>
 
 BallPresenceTrigger::BallPresenceTrigger(
-    cv::Rect roi,
+    DotClusterConfig dotConfig,
+    double nominalBallRadiusPx,
     int lockFrames,
-    int thresh,
-    double minArea,
-    double maxArea,
-    double minCirc,
     float matchThreshold,
     double lossTimeout
-) : teeROI(roi),
+) : finder(dotConfig, nominalBallRadiusPx),
     lockFrameCount(lockFrames),
-    ballThreshold(thresh),
-    minBallArea(minArea),
-    maxBallArea(maxArea),
-    minCircularity(minCirc),
     matchScoreThreshold(matchThreshold),
     lossTimeoutSec(lossTimeout),
     state(TriggerState::WAITING_FOR_BALL),
@@ -26,14 +19,13 @@ BallPresenceTrigger::BallPresenceTrigger(
     lastCandidateCentroid(0, 0),
     hasEmptyStartTime(false),
     emitterMode(EmitterPowerMode::HIGH_STROBE_READY) {
-    
+
     latestDiag = {
         {"state", "WAITING_FOR_BALL"},
         {"triggered", false},
         {"stabilityCounter", 0},
         {"lockFrameCount", lockFrameCount},
         {"matchScore", 1.0f},
-        {"teeROI", {teeROI.x, teeROI.y, teeROI.width, teeROI.height}},
         {"lockedBallBox", {0, 0, 0, 0}},
         {"emitterMode", "READY"},
         {"emptyDurationSec", 0.0}
@@ -49,55 +41,24 @@ bool BallPresenceTrigger::checkOpticalGate(const cv::Mat& currentFrame) {
         return false;
     }
 
-    cv::Rect safeTeeRoi = teeROI & cv::Rect(0, 0, currentFrame.cols, currentFrame.rows);
-    if (safeTeeRoi.area() <= 0) {
-        return false;
-    }
-
-    cv::Mat roiFrame = currentFrame(safeTeeRoi);
-    if (roiFrame.channels() == 3) {
-        cv::cvtColor(roiFrame, grayRoi, cv::COLOR_BGR2GRAY);
-    } else if (roiFrame.channels() == 4) {
-        cv::cvtColor(roiFrame, grayRoi, cv::COLOR_BGRA2GRAY);
+    if (currentFrame.channels() == 3) {
+        cv::cvtColor(currentFrame, gray, cv::COLOR_BGR2GRAY);
+    } else if (currentFrame.channels() == 4) {
+        cv::cvtColor(currentFrame, gray, cv::COLOR_BGRA2GRAY);
     } else {
-        grayRoi = roiFrame;
+        gray = currentFrame;
     }
 
     if (state == TriggerState::WAITING_FOR_BALL) {
-        cv::threshold(grayRoi, threshRoi, ballThreshold, 255, cv::THRESH_BINARY);
-
-        std::vector<std::vector<cv::Point>> contours;
-        cv::findContours(threshRoi, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+        // Whole-frame dot-cluster search: no tee ROI (refactor 09, 3.7)
+        finder.find(gray, result);
 
         cv::Point2d validCentroid(0, 0);
         cv::Rect validBoundBox(0, 0, 0, 0);
-        int validCount = 0;
-
-        for (const auto& contour : contours) {
-            double area = cv::contourArea(contour);
-            if (area < minBallArea || area > maxBallArea) {
-                continue;
-            }
-
-            double perimeter = cv::arcLength(contour, true);
-            double circularity = 0.0;
-            if (perimeter > 0.0) {
-                circularity = (4.0 * CV_PI * area) / (perimeter * perimeter);
-            }
-
-            if (circularity >= minCircularity) {
-                cv::Moments m = cv::moments(contour);
-                if (m.m00 > 0.0) {
-                    cv::Point2d localCentroid(m.m10 / m.m00, m.m01 / m.m00);
-                    cv::Point2d globalCentroid(safeTeeRoi.x + localCentroid.x, safeTeeRoi.y + localCentroid.y);
-                    cv::Rect localBox = cv::boundingRect(contour);
-                    cv::Rect globalBox(safeTeeRoi.x + localBox.x, safeTeeRoi.y + localBox.y, localBox.width, localBox.height);
-
-                    validCentroid = globalCentroid;
-                    validBoundBox = globalBox;
-                    validCount++;
-                }
-            }
+        int validCount = static_cast<int>(result.clusters.size());
+        if (validCount > 0) {
+            validCentroid = result.clusters[0].centroid;
+            validBoundBox = result.clusters[0].boundingBox;
         }
 
         if (validCount == 1) {
@@ -118,16 +79,9 @@ bool BallPresenceTrigger::checkOpticalGate(const cv::Mat& currentFrame) {
                 lockedBallBox = validBoundBox;
 
                 // Extract and store 2D pixel template of locked ball in grayscale
-                cv::Rect safeLockRoi = lockedBallBox & cv::Rect(0, 0, currentFrame.cols, currentFrame.rows);
+                cv::Rect safeLockRoi = lockedBallBox & cv::Rect(0, 0, gray.cols, gray.rows);
                 if (safeLockRoi.area() > 0) {
-                    cv::Mat lockMat = currentFrame(safeLockRoi);
-                    if (lockMat.channels() == 3) {
-                        cv::cvtColor(lockMat, lockedBallTemplate, cv::COLOR_BGR2GRAY);
-                    } else if (lockMat.channels() == 4) {
-                        cv::cvtColor(lockMat, lockedBallTemplate, cv::COLOR_BGRA2GRAY);
-                    } else {
-                        lockedBallTemplate = lockMat.clone();
-                    }
+                    lockedBallTemplate = gray(safeLockRoi).clone();
                 }
 
                 spdlog::info("[BallPresenceTrigger] Ball locked at ({:.1f}, {:.1f}) after {} stable frames! Stored 2D pixel template ({}x{}).",
@@ -160,11 +114,12 @@ bool BallPresenceTrigger::checkOpticalGate(const cv::Mat& currentFrame) {
             {"stabilityCounter", stabilityCounter},
             {"lockFrameCount", lockFrameCount},
             {"matchScore", 1.0f},
-            {"teeROI", {safeTeeRoi.x, safeTeeRoi.y, safeTeeRoi.width, safeTeeRoi.height}},
             {"candidateCentroid", {validCentroid.x, validCentroid.y}},
+            {"candidateCount", validCount},
             {"lockedBallBox", {lockedBallBox.x, lockedBallBox.y, lockedBallBox.width, lockedBallBox.height}},
             {"emitterMode", (emitterMode == EmitterPowerMode::LOW_STANDBY) ? "STANDBY" : "READY"},
-            {"emptyDurationSec", emptySec}
+            {"emptyDurationSec", emptySec},
+            {"dots", result.toJson()}
         };
         return false;
 
@@ -172,19 +127,11 @@ bool BallPresenceTrigger::checkOpticalGate(const cv::Mat& currentFrame) {
         hasEmptyStartTime = false;
         emitterMode = EmitterPowerMode::HIGH_STROBE_READY;
 
-        cv::Rect safeLockRoi = lockedBallBox & cv::Rect(0, 0, currentFrame.cols, currentFrame.rows);
+        cv::Rect safeLockRoi = lockedBallBox & cv::Rect(0, 0, gray.cols, gray.rows);
         float matchScore = 0.0f;
 
         if (safeLockRoi.area() > 0 && !lockedBallTemplate.empty() && safeLockRoi.size() == lockedBallTemplate.size()) {
-            cv::Mat currentPatch = currentFrame(safeLockRoi);
-            cv::Mat currentGray;
-            if (currentPatch.channels() == 3) {
-                cv::cvtColor(currentPatch, currentGray, cv::COLOR_BGR2GRAY);
-            } else if (currentPatch.channels() == 4) {
-                cv::cvtColor(currentPatch, currentGray, cv::COLOR_BGRA2GRAY);
-            } else {
-                currentGray = currentPatch;
-            }
+            cv::Mat currentGray = gray(safeLockRoi);
 
             // Run 2D Normalized Cross-Correlation Template Matching
             cv::matchTemplate(currentGray, lockedBallTemplate, matchResult, cv::TM_CCOEFF_NORMED);
@@ -208,7 +155,6 @@ bool BallPresenceTrigger::checkOpticalGate(const cv::Mat& currentFrame) {
                 {"stabilityCounter", stabilityCounter},
                 {"lockFrameCount", lockFrameCount},
                 {"matchScore", matchScore},
-                {"teeROI", {safeTeeRoi.x, safeTeeRoi.y, safeTeeRoi.width, safeTeeRoi.height}},
                 {"lockedBallBox", {lockedBallBox.x, lockedBallBox.y, lockedBallBox.width, lockedBallBox.height}},
                 {"emitterMode", "READY"},
                 {"emptyDurationSec", 0.0}
@@ -221,7 +167,6 @@ bool BallPresenceTrigger::checkOpticalGate(const cv::Mat& currentFrame) {
                 {"stabilityCounter", stabilityCounter},
                 {"lockFrameCount", lockFrameCount},
                 {"matchScore", matchScore},
-                {"teeROI", {safeTeeRoi.x, safeTeeRoi.y, safeTeeRoi.width, safeTeeRoi.height}},
                 {"lockedBallBox", {lockedBallBox.x, lockedBallBox.y, lockedBallBox.width, lockedBallBox.height}},
                 {"emitterMode", "READY"},
                 {"emptyDurationSec", 0.0}
@@ -248,7 +193,6 @@ bool BallPresenceTrigger::checkOpticalGate(const cv::Mat& currentFrame) {
             {"stabilityCounter", stabilityCounter},
             {"lockFrameCount", lockFrameCount},
             {"matchScore", 0.0f},
-            {"teeROI", {safeTeeRoi.x, safeTeeRoi.y, safeTeeRoi.width, safeTeeRoi.height}},
             {"lockedBallBox", {lockedBallBox.x, lockedBallBox.y, lockedBallBox.width, lockedBallBox.height}},
             {"emitterMode", (emitterMode == EmitterPowerMode::LOW_STANDBY) ? "STANDBY" : "READY"},
             {"emptyDurationSec", emptySec}
@@ -274,7 +218,6 @@ void BallPresenceTrigger::reset() {
         {"stabilityCounter", 0},
         {"lockFrameCount", lockFrameCount},
         {"matchScore", 1.0f},
-        {"teeROI", {teeROI.x, teeROI.y, teeROI.width, teeROI.height}},
         {"lockedBallBox", {0, 0, 0, 0}},
         {"emitterMode", "READY"},
         {"emptyDurationSec", 0.0}
