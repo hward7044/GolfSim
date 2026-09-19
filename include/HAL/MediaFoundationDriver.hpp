@@ -39,6 +39,7 @@ private:
     uint32_t frameHeight_ = 0;
     int32_t  frameStride_ = 0;   // Signed: MF can return negative stride for bottom-up
     bool     isNV12_      = false;
+    uint64_t lastTimestampUs_ = 0;  // From IMFSourceReader::ReadSample (100 ns -> us)
 
     // --- Internal helpers ---
     bool initializeMediaFoundation();
@@ -78,5 +79,6 @@ public:
     bool grabRawFrame(cv::Mat& destination) override;
     void setHardwareExposure(int microseconds) override;
     void injectImmediateRegisterWrite(uint16_t reg, uint8_t value) override;
+    uint64_t getLastFrameTimestampUs() const override { return lastTimestampUs_; }
 };
 #endif

@@ -11,6 +11,8 @@ bool HardwareSyncedCameraSystem::captureSynchronizedFrames(FrameSet& frameSet) {
             return false;
         }
     }
+    // Stamp the set with the first (left) camera's kernel capture time
+    frameSet.timestamp = cameras.front()->getLastFrameTimestampUs();
     return true;
 }
 

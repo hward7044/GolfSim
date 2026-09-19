@@ -26,8 +26,10 @@
 #ifdef _WIN32
 #include "HAL/MediaFoundationDriver.hpp"
 #include "HAL/Win32Serial.hpp"
+using PlatformCameraDriver = MediaFoundationDriver;
 #else
 #include "HAL/V4L2Driver.hpp"
+using PlatformCameraDriver = V4L2Driver;
 #endif
 #include "Math/AtomicRingBuffer.hpp"
 #include "Math/BallPresenceTrigger.hpp"
@@ -53,11 +55,22 @@
 #include <sstream>
 
 const bool RUN_DEBUG_VIEWER = false;
-#ifdef _WIN32
-void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& comPort = "COM3");
+
+// Construct the platform camera driver by logical index, or by explicit device
+// path when one was given on the command line (Linux only; ignored on Windows).
+static std::unique_ptr<PlatformCameraDriver> makeCameraDriver(int index, const std::string& devicePath) {
+#ifdef __linux__
+  if (!devicePath.empty()) {
+    return std::make_unique<PlatformCameraDriver>(devicePath);
+  }
 #else
-void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& comPort = "/dev/ttyACM0");
+  (void)devicePath;
 #endif
+  return std::make_unique<PlatformCameraDriver>(static_cast<uint32_t>(index));
+}
+
+void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& comPort,
+                          const std::string& leftDev = "", const std::string& rightDev = "");
 
 void runReplayViewer(const std::string &replayDir);
 
@@ -73,6 +86,8 @@ int main(int argc, char *argv[]) {
 #endif
 
   bool liveMode = false;
+  std::string leftDev;   // Linux: explicit /dev/videoN override for --left-cam
+  std::string rightDev;  // Linux: explicit /dev/videoN override for --right-cam
 
   // Parse command line arguments
   for (int i = 1; i < argc; ++i) {
@@ -97,8 +112,15 @@ int main(int argc, char *argv[]) {
     if (arg == "--right-cam" && i + 1 < argc) {
       rightCamIdx = std::atoi(argv[++i]);
     }
+    if (arg == "--left-dev" && i + 1 < argc) {
+      leftDev = argv[++i];
+    }
+    if (arg == "--right-dev" && i + 1 < argc) {
+      rightDev = argv[++i];
+    }
     if (arg == "--swap-cameras" || arg == "--swap") {
       std::swap(leftCamIdx, rightCamIdx);
+      std::swap(leftDev, rightDev);
     }
     if (arg == "--com" && i + 1 < argc) {
       comPort = argv[++i];
@@ -106,7 +128,7 @@ int main(int argc, char *argv[]) {
   }
 
   if (liveMode) {
-    runCameraDebugViewer(leftCamIdx, rightCamIdx, comPort);
+    runCameraDebugViewer(leftCamIdx, rightCamIdx, comPort, leftDev, rightDev);
     return 0;
   }
   // Determine compiler-specific C++ standard version
@@ -158,7 +180,7 @@ int main(int argc, char *argv[]) {
   std::cout << "Verification completed successfully!" << std::endl;
 
   if (RUN_DEBUG_VIEWER) {
-    runCameraDebugViewer(leftCamIdx, rightCamIdx, comPort);
+    runCameraDebugViewer(leftCamIdx, rightCamIdx, comPort, leftDev, rightDev);
     return 0;
   }
 
@@ -184,16 +206,17 @@ int main(int argc, char *argv[]) {
 
   auto cameraSystem = std::make_shared<HardwareSyncedCameraSystem>();
 
-#ifdef _WIN32
   spdlog::info("[System] Initializing camera drivers...");
-  MediaFoundationDriver::logConnectedDevices();
+  PlatformCameraDriver::logConnectedDevices();
 
-  // 2. Initialize the MediaFoundationDrivers with correct hardware device mapping
-  spdlog::info("[System] Mapping Left Camera to Index {}, Right Camera to Index {}", leftCamIdx, rightCamIdx);
-  auto usbLeft = std::make_unique<MediaFoundationDriver>(leftCamIdx);
+  // 2. Initialize the platform camera drivers with correct hardware device mapping
+  spdlog::info("[System] Mapping Left Camera to Index {}{}, Right Camera to Index {}{}",
+               leftCamIdx, leftDev.empty() ? "" : " (" + leftDev + ")",
+               rightCamIdx, rightDev.empty() ? "" : " (" + rightDev + ")");
+  auto usbLeft = makeCameraDriver(leftCamIdx, leftDev);
   bool leftOk = usbLeft->initialize();
 
-  auto usbRight = std::make_unique<MediaFoundationDriver>(rightCamIdx);
+  auto usbRight = makeCameraDriver(rightCamIdx, rightDev);
   bool rightOk = usbRight->initialize();
 
   if (!leftOk && !rightOk) {
@@ -224,12 +247,6 @@ int main(int argc, char *argv[]) {
     spdlog::info("[System] Successfully registered Right camera ({}x{})", width,
                  height);
   }
-#else
-  spdlog::info("[System] Initializing camera drivers...");
-  spdlog::warn("[System] Hardware camera drivers (MediaFoundation) are only supported on Windows.");
-  spdlog::warn("[System] Failed to initialize camera hardware (expected in emulation/test environments). Clean exit.");
-  return 0;
-#endif
 
   // Queue buffer manager (capacity of 16 FrameSets)
   auto buffer = std::make_shared<AtomicRingBuffer<FrameSet, 16>>();
@@ -315,8 +332,8 @@ int main(int argc, char *argv[]) {
 // -------------------------------------------------------------------------
 // Live Camera Setup and IR Strobe Debug Viewer
 // -------------------------------------------------------------------------
-void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& comPort) {
-#ifdef _WIN32
+void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& comPort,
+                          const std::string& leftDev, const std::string& rightDev) {
   std::cout << "\n============================================" << std::endl;
   std::cout << "Starting Live Camera & IR Strobe Debug Viewer" << std::endl;
   std::cout << "============================================" << std::endl;
@@ -329,15 +346,17 @@ void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& co
   }
 
   // 1. Enumerate connected video capture devices
-  MediaFoundationDriver::logConnectedDevices();
+  PlatformCameraDriver::logConnectedDevices();
 
-  // 2. Initialize MediaFoundationDrivers with user-specified indices
-  std::cout << "\nInitializing Left camera (Index " << leftCamIdx << ")..." << std::endl;
-  auto usbDriverLeft = std::make_unique<MediaFoundationDriver>(leftCamIdx);
+  // 2. Initialize platform camera drivers with user-specified indices
+  std::cout << "\nInitializing Left camera (Index " << leftCamIdx
+            << (leftDev.empty() ? "" : ", " + leftDev) << ")..." << std::endl;
+  auto usbDriverLeft = makeCameraDriver(leftCamIdx, leftDev);
   bool leftOk = usbDriverLeft->initialize();
 
-  std::cout << "Initializing Right camera (Index " << rightCamIdx << ")..." << std::endl;
-  auto usbDriverRight = std::make_unique<MediaFoundationDriver>(rightCamIdx);
+  std::cout << "Initializing Right camera (Index " << rightCamIdx
+            << (rightDev.empty() ? "" : ", " + rightDev) << ")..." << std::endl;
+  auto usbDriverRight = makeCameraDriver(rightCamIdx, rightDev);
   bool rightOk = usbDriverRight->initialize();
 
   if (!leftOk && !rightOk) {
@@ -567,12 +586,6 @@ void runCameraDebugViewer(int leftCamIdx, int rightCamIdx, const std::string& co
   cv::destroyAllWindows();
   cameraSystem.shutdown();
   std::cout << "Strobe Debugger shutdown cleanly." << std::endl;
-#else
-  (void)leftCamIdx;
-  (void)rightCamIdx;
-  (void)comPort;
-  std::cerr << "Live Camera & IR Strobe Debug Viewer is only supported on Windows (requires MediaFoundation & Win32Serial)." << std::endl;
-#endif
 }
 
 void runReplayViewer(const std::string &replayDir) {

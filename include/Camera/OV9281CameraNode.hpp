@@ -12,5 +12,6 @@ public:
     bool captureFrame(cv::Mat& destination) override;
     CameraRole getRole() override;
     void setExposure(int microseconds);
+    uint64_t getLastFrameTimestampUs() const override;
     void shutdown() override;
 };

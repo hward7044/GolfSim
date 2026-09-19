@@ -16,5 +16,9 @@ public:
     // Allows microsecond I2C register updates.
     virtual void injectImmediateRegisterWrite(uint16_t reg, uint8_t value) = 0;
 
+    /// @brief Capture timestamp of the most recent grabRawFrame(), in microseconds
+    /// on a monotonic clock. Returns 0 if the backend does not provide one.
+    virtual uint64_t getLastFrameTimestampUs() const { return 0; }
+
     virtual void shutdown() {}
 };

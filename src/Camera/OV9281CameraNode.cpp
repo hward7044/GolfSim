@@ -18,6 +18,10 @@ void OV9281CameraNode::setExposure(int microseconds) {
     }
 }
 
+uint64_t OV9281CameraNode::getLastFrameTimestampUs() const {
+    return usbDriver ? usbDriver->getLastFrameTimestampUs() : 0;
+}
+
 void OV9281CameraNode::shutdown() {
     if (usbDriver) {
         usbDriver->shutdown();

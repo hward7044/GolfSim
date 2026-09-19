@@ -40,3 +40,31 @@ cmake -B build -S .
 # Build
 cmake --build build
 ```
+
+### Linux Device Permissions (one-time)
+
+| Device | Group | Notes |
+| :--- | :--- | :--- |
+| `/dev/video*` (cameras) | `video` | Already accessible to the locally logged-in user via systemd-logind `uaccess`. |
+| `/dev/ttyACM0` (strobe controller) | `uucp` | **Not** covered by `uaccess`. Run `sudo usermod -aG uucp $USER` and log out/in. |
+
+### Linux Camera Selection
+
+`uvcvideo` creates two `/dev/video*` nodes per camera (capture + metadata). `--left-cam N` / `--right-cam N` are **logical** indices over capture-capable nodes only, so the two cameras are `0` and `1` regardless of the raw node numbers. To pin a specific node:
+
+```bash
+./build/GolfSim --live --left-dev /dev/video2 --right-dev /dev/video0
+# Stable across re-plugs:
+./build/GolfSim --left-dev /dev/v4l/by-id/usb-Arducam_..._-video-index0
+```
+
+Cross-check what the driver negotiated:
+
+```bash
+v4l2-ctl --list-devices
+v4l2-ctl -d /dev/videoN --list-formats-ext     # GREY / NV12 / YUYV at 1280x800?
+v4l2-ctl -d /dev/videoN -L                     # control ranges (exposure_time_absolute is in 100 us units)
+v4l2-ctl -d /dev/videoN -C exposure_time_absolute
+```
+
+If the second camera fails `VIDIOC_STREAMON` with `ENOSPC`, USB bandwidth is exhausted — move it to a different USB controller / USB 3 port, or `sudo modprobe -r uvcvideo && sudo modprobe uvcvideo quirks=0x80`.

@@ -531,6 +531,7 @@ bool MediaFoundationDriver::grabRawFrame(cv::Mat& destination) {
         absStride
     );
     wrapper.copyTo(destination);
+    lastTimestampUs_ = static_cast<uint64_t>(timestamp / 10);  // MF sample time is in 100 ns units
 
     // Unlock ASAP — release the USB/DMA buffer back to the driver
     pBuffer->Unlock();
