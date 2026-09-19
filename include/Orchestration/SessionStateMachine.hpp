@@ -62,6 +62,7 @@ private:
     Kinematics     kinematics;
     Net            network;
     FlightRecorder recorder;
+    std::string    shotHistoryPath_;
 
     // Timing and optical configuration
     PipelineTimingConfig timingConfig;
@@ -97,7 +98,7 @@ private:
         return nlohmann::json::object();
     }
 
-    // Helper to log solved shot data to build/shot_history.json
+    // Helper to append solved shot data to the JSON Lines history file
     void saveToShotHistory(const LaunchData<Degrees, MilesPerHour>& data) {
         nlohmann::json j;
         j["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -109,16 +110,11 @@ private:
         j["spinAxis"] = { data.spinAxis.x(), data.spinAxis.y(), data.spinAxis.z() };
 
         // Append to JSON Lines file for easy programmatic parsing
-        std::ofstream out("build/shot_history.json", std::ios::app);
+        std::ofstream out(shotHistoryPath_, std::ios::app);
         if (out.is_open()) {
             out << j.dump() << "\n";
-            out.close();
         } else {
-            std::ofstream outFallback("shot_history.json", std::ios::app);
-            if (outFallback.is_open()) {
-                outFallback << j.dump() << "\n";
-                outFallback.close();
-            }
+            spdlog::warn("[SessionStateMachine] Could not open shot history file {}", shotHistoryPath_);
         }
     }
 
@@ -129,12 +125,16 @@ public:
         Spatial s = Spatial(),
         Kinematics k = Kinematics(),
         Net n = Net(),
-        PipelineTimingConfig timing = PipelineTimingConfig()
+        PipelineTimingConfig timing = PipelineTimingConfig(),
+        std::string replayDir = "build/replays",
+        std::string shotHistoryPath = "build/shot_history.json"
     ) : trigger(std::move(t)),
         vision(std::move(v)),
         spatial(std::move(s)),
         kinematics(std::move(k)),
         network(std::move(n)),
+        recorder(replayDir),
+        shotHistoryPath_(std::move(shotHistoryPath)),
         timingConfig(timing) {
         // Pre-allocate 40 recorded frames for zero-allocation copying in the hot path
         recordedFramesPool.resize(40);

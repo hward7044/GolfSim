@@ -1,0 +1,10 @@
+{
+  "_comment": "Ratchet: raise to the measured value whenever tests are added; never lower. 100.0 is terminal. Baseline measured 2026-09-19 with clang-22 / llvm-cov (Phase C0). See docs/refactor/07_Test_Infrastructure_Plan.md section 8.4.",
+  "gated_paths": ["src/", "include/"],
+  "ungated_paths": ["src/main.cpp"],
+  "exclusion_budget_percent": 2.0,
+  "lines": 58.9,
+  "regions": 41.8,
+  "branches": 42.5,
+  "mcdc": 13.3
+}

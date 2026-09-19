@@ -92,6 +92,15 @@ int main(int argc, char *argv[]) {
   // Parse command line arguments
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
+    if (arg == "--version" || arg == "-v") {
+      std::cout << "GolfSim"
+                << "  OpenCV " << CV_VERSION
+                << "  Eigen " << EIGEN_WORLD_VERSION << "." << EIGEN_MAJOR_VERSION << "." << EIGEN_MINOR_VERSION
+                << "  spdlog " << SPDLOG_VER_MAJOR << "." << SPDLOG_VER_MINOR << "." << SPDLOG_VER_PATCH
+                << "  json " << NLOHMANN_JSON_VERSION_MAJOR << "." << NLOHMANN_JSON_VERSION_MINOR << "." << NLOHMANN_JSON_VERSION_PATCH
+                << std::endl;
+      return 0;
+    }
     if ((arg == "--replay" || arg == "-r") && i + 1 < argc) {
       runReplayViewer(argv[i + 1]);
       return 0;
@@ -131,53 +140,6 @@ int main(int argc, char *argv[]) {
     runCameraDebugViewer(leftCamIdx, rightCamIdx, comPort, leftDev, rightDev);
     return 0;
   }
-  // Determine compiler-specific C++ standard version
-  long cpp_version = __cplusplus;
-#ifdef _MSVC_LANG
-  cpp_version = _MSVC_LANG;
-#endif
-
-  std::cout << "============================================" << std::endl;
-  std::cout << "GolfSim Build Environment Verification" << std::endl;
-  std::cout << "============================================" << std::endl;
-  std::cout << "C++ Standard: " << cpp_version << " (e.g., 202002 for C++20)"
-            << std::endl;
-  std::cout << "OpenCV Version: " << CV_VERSION << std::endl;
-  std::cout << "Eigen Version: " << EIGEN_WORLD_VERSION << "."
-            << EIGEN_MAJOR_VERSION << "." << EIGEN_MINOR_VERSION << std::endl;
-  std::cout << "spdlog Version: " << SPDLOG_VER_MAJOR << "." << SPDLOG_VER_MINOR
-            << "." << SPDLOG_VER_PATCH << std::endl;
-  std::cout << "nlohmann/json Version: " << NLOHMANN_JSON_VERSION_MAJOR << "."
-            << NLOHMANN_JSON_VERSION_MINOR << "." << NLOHMANN_JSON_VERSION_PATCH
-            << std::endl;
-  std::cout << "============================================" << std::endl;
-
-  // Test nlohmann/json
-  nlohmann::json test_json;
-  test_json["status"] = "OK";
-  test_json["message"] = "Build environment is fully operational!";
-  std::cout << "JSON Test Output: " << test_json.dump() << std::endl;
-
-  // Test spdlog
-  spdlog::info("spdlog is working correctly.");
-
-  // Test Eigen Matrix multiplication
-  Eigen::Matrix2d mat;
-  mat << 1, 2, 3, 4;
-  std::cout << "Eigen Matrix multiplication test:\n" << mat * mat << std::endl;
-
-  // Test OpenCV Matrix creation
-  cv::Mat image = cv::Mat::zeros(100, 100, CV_8UC3);
-  std::cout << "OpenCV Matrix created successfully. Dimensions: " << image.rows
-            << "x" << image.cols << std::endl;
-
-  std::cout << "============================================" << std::endl;
-
-  // Run C++ Math Verification Tests
-  void runMathTests();
-  runMathTests(); // Run verification tests on startup
-
-  std::cout << "Verification completed successfully!" << std::endl;
 
   if (RUN_DEBUG_VIEWER) {
     runCameraDebugViewer(leftCamIdx, rightCamIdx, comPort, leftDev, rightDev);

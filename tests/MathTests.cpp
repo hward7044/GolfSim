@@ -13,7 +13,10 @@
 #include <Eigen/Geometry>
 #include <opencv2/imgproc.hpp>
 #include <spdlog/spdlog.h>
-#include <cassert>
+#include "TestAssert.hpp"
+#include "TestRegistry.hpp"
+#include "TestSandbox.hpp"
+#include "Mocks.hpp"
 #include <cmath>
 #include <vector>
 #include <iostream>
@@ -22,26 +25,26 @@
 #include <numbers>
 
 
-void testUnits() {
+GOLFSIM_TEST(Units) {
     MetersPerSecond mps(10.0);
     MilesPerHour mph = to_mph(mps);
-    assert(std::abs(mph.value() - 22.36936) < 1e-4);
+    TEST_ASSERT(std::abs(mph.value() - 22.36936) < 1e-4);
 
     Radians rad(std::numbers::pi / 4.0);
     Degrees deg = to_degrees(rad);
-    assert(std::abs(deg.value() - 45.0) < 1e-4);
+    TEST_ASSERT(std::abs(deg.value() - 45.0) < 1e-4);
 
     Degrees deg2(90.0);
     Radians rad2 = to_radians(deg2);
-    assert(std::abs(rad2.value() - std::numbers::pi / 2.0) < 1e-6);
+    TEST_ASSERT(std::abs(rad2.value() - std::numbers::pi / 2.0) < 1e-6);
 
     MetersPerSecond mps2 = to_mps(mph);
-    assert(std::abs(mps2.value() - 10.0) < 1e-5);
+    TEST_ASSERT(std::abs(mps2.value() - 10.0) < 1e-5);
 
     spdlog::info("[TEST] Units verification passed.");
 }
 
-void testBallPresenceTrigger() {
+GOLFSIM_TEST(BallPresenceTrigger) {
     cv::Rect teeRoi(10, 10, 80, 80);
     BallPresenceTrigger trigger(teeRoi, 5, 50, 50, 1000, 0.5, 0.5);
 
@@ -52,55 +55,55 @@ void testBallPresenceTrigger() {
     // Feed for 4 frames (under stability threshold 5)
     for (int i = 0; i < 4; ++i) {
         bool trig = trigger.checkOpticalGate(ballFrame);
-        assert(!trig);
+        TEST_ASSERT(!trig);
         nlohmann::json diag = trigger.getLatestDiagnostics();
-        assert(diag["state"] == "WAITING_FOR_BALL");
-        assert(diag["stabilityCounter"] == i + 1);
+        TEST_ASSERT(diag["state"] == "WAITING_FOR_BALL");
+        TEST_ASSERT(diag["stabilityCounter"] == i + 1);
     }
 
     // 5th frame reaches stability threshold -> BALL_LOCKED
     bool trigLock = trigger.checkOpticalGate(ballFrame);
-    assert(!trigLock);
+    TEST_ASSERT(!trigLock);
     nlohmann::json diagLocked = trigger.getLatestDiagnostics();
-    assert(diagLocked["state"] == "BALL_LOCKED");
+    TEST_ASSERT(diagLocked["state"] == "BALL_LOCKED");
 
     // Shadow Test: Dim the ball intensity by 30% (simulating hand/club shadow or IR fluctuation)
     cv::Mat dimmedFrame = cv::Mat::zeros(100, 100, CV_8UC1);
     cv::circle(dimmedFrame, cv::Point(50, 50), 15, cv::Scalar(140), -1);
     bool trigShadow = trigger.checkOpticalGate(dimmedFrame);
-    assert(!trigShadow); // SHADOW IMMUNITY PASSED: Must NOT trigger false departure!
+    TEST_ASSERT(!trigShadow); // SHADOW IMMUNITY PASSED: Must NOT trigger false departure!
     nlohmann::json diagShadow = trigger.getLatestDiagnostics();
-    assert(diagShadow["state"] == "BALL_LOCKED");
-    assert(diagShadow["matchScore"].get<float>() > 0.70f);
+    TEST_ASSERT(diagShadow["state"] == "BALL_LOCKED");
+    TEST_ASSERT(diagShadow["matchScore"].get<float>() > 0.70f);
 
     // Departure Test: Feed black frame (ball physically departed from tee)
     cv::Mat blankFrame = cv::Mat::zeros(100, 100, CV_8UC1);
     bool trigDeparted = trigger.checkOpticalGate(blankFrame);
-    assert(trigDeparted); // Triggered! Ball pixel pattern vanished.
+    TEST_ASSERT(trigDeparted); // Triggered! Ball pixel pattern vanished.
     nlohmann::json diagDeparted = trigger.getLatestDiagnostics();
-    assert(diagDeparted["state"] == "BALL_DEPARTED");
+    TEST_ASSERT(diagDeparted["state"] == "BALL_DEPARTED");
 
     // Test reset
     trigger.reset();
     nlohmann::json diagReset = trigger.getLatestDiagnostics();
-    assert(diagReset["state"] == "WAITING_FOR_BALL");
-    assert(diagReset["stabilityCounter"] == 0);
-    assert(trigger.getEmitterMode() == EmitterPowerMode::HIGH_STROBE_READY);
+    TEST_ASSERT(diagReset["state"] == "WAITING_FOR_BALL");
+    TEST_ASSERT(diagReset["stabilityCounter"] == 0);
+    TEST_ASSERT(trigger.getEmitterMode() == EmitterPowerMode::HIGH_STROBE_READY);
 
     // Emitter Protection Test: Fast loss timeout (50ms)
     trigger.setLossTimeoutSec(0.05); // 50 ms test timeout
     trigger.checkOpticalGate(blankFrame); // Starts empty timer
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
     trigger.checkOpticalGate(blankFrame); // Triggers timeout
-    assert(trigger.getEmitterMode() == EmitterPowerMode::LOW_STANDBY);
-    assert(trigger.isStandbyRequested());
+    TEST_ASSERT(trigger.getEmitterMode() == EmitterPowerMode::LOW_STANDBY);
+    TEST_ASSERT(trigger.isStandbyRequested());
     nlohmann::json diagStandby = trigger.getLatestDiagnostics();
-    assert(diagStandby["emitterMode"] == "STANDBY");
+    TEST_ASSERT(diagStandby["emitterMode"] == "STANDBY");
 
     // Restoring ball on tee immediately wakes up to HIGH_STROBE_READY
     trigger.checkOpticalGate(ballFrame);
-    assert(trigger.getEmitterMode() == EmitterPowerMode::HIGH_STROBE_READY);
-    assert(!trigger.isStandbyRequested());
+    TEST_ASSERT(trigger.getEmitterMode() == EmitterPowerMode::HIGH_STROBE_READY);
+    TEST_ASSERT(!trigger.isStandbyRequested());
 
     // Verify ITriggerDetector interface polymorphism and zero recursion
     ITriggerDetector* baseDetector = &trigger;
@@ -112,7 +115,7 @@ void testBallPresenceTrigger() {
     spdlog::info("[TEST] BallPresenceTrigger verification passed (including dynamic emitter protection).");
 }
 
-void testOpenCVMomentsTracker() {
+GOLFSIM_TEST(OpenCVMomentsTracker) {
     OpenCVMomentsTracker tracker(50, 200, 50, 10000, 0.5);
 
     // Create frame with a simulated ball (circle of radius 15) and a single marker inside it
@@ -128,16 +131,16 @@ void testOpenCVMomentsTracker() {
     cv::rectangle(frame, cv::Rect(300, 50, 4, 25), cv::Scalar(100), -1);
 
     auto balls = tracker.detectBalls(frame);
-    assert(balls.size() == 1);
-    assert(std::abs(balls[0].centroid.x - 200) < 1.0);
-    assert(std::abs(balls[0].centroid.y - 200) < 1.0);
-    assert(balls[0].markers.size() == 1);
-    assert(std::abs(balls[0].markers[0].position.x - 205) < 1.0);
-    assert(std::abs(balls[0].markers[0].position.y - 195) < 1.0);
+    TEST_ASSERT(balls.size() == 1);
+    TEST_ASSERT(std::abs(balls[0].centroid.x - 200) < 1.0);
+    TEST_ASSERT(std::abs(balls[0].centroid.y - 200) < 1.0);
+    TEST_ASSERT(balls[0].markers.size() == 1);
+    TEST_ASSERT(std::abs(balls[0].markers[0].position.x - 205) < 1.0);
+    TEST_ASSERT(std::abs(balls[0].markers[0].position.y - 195) < 1.0);
 
     // Verify diagnostics
     nlohmann::json vdiag = tracker.getLatestDiagnostics();
-    assert(vdiag["candidates"].size() >= 3);
+    TEST_ASSERT(vdiag["candidates"].size() >= 3);
     bool foundBall = false;
     bool foundNoiseArea = false;
     bool foundNoiseCirc = false;
@@ -146,10 +149,10 @@ void testOpenCVMomentsTracker() {
         std::string reason = cand.value("reason", "");
         if (accepted) {
             auto cen = cand["centroid"];
-            assert(std::abs(cen[0].get<double>() - 200) < 1.0);
-            assert(reason == "Accepted (Moments)");
-            assert(cand["markers"].size() == 1);
-            assert(std::abs(cand["markers"][0][0].get<double>() - 205) < 1.0);
+            TEST_ASSERT(std::abs(cen[0].get<double>() - 200) < 1.0);
+            TEST_ASSERT(reason == "Accepted (Moments)");
+            TEST_ASSERT(cand["markers"].size() == 1);
+            TEST_ASSERT(std::abs(cand["markers"][0][0].get<double>() - 205) < 1.0);
             foundBall = true;
         } else if (reason == "Area too small") {
             foundNoiseArea = true;
@@ -157,14 +160,14 @@ void testOpenCVMomentsTracker() {
             foundNoiseCirc = true;
         }
     }
-    assert(foundBall);
-    assert(foundNoiseArea);
-    assert(foundNoiseCirc);
+    TEST_ASSERT(foundBall);
+    TEST_ASSERT(foundNoiseArea);
+    TEST_ASSERT(foundNoiseCirc);
 
     spdlog::info("[TEST] OpenCVMomentsTracker verification passed.");
 }
 
-void testStereoTriangulatorAndRaySphere() {
+GOLFSIM_TEST(StereoTriangulatorAndRaySphere) {
     StereoCalibration calib;
     // Let's set up a standard horizontal camera setup.
     // Focal length = 1000 pixels. Center = (640, 400).
@@ -213,40 +216,40 @@ void testStereoTriangulatorAndRaySphere() {
     bR.markers.push_back(mr);
 
     auto result3D = solver.triangulateShot({ bL }, { bR });
-    assert(result3D.size() == 1);
-    assert(std::abs(result3D[0].centroid.z() - 1.5) < 1e-3);
-    assert(std::abs(result3D[0].centroid.x() - 0.0) < 1e-3);
-    assert(std::abs(result3D[0].centroid.y() - 0.0) < 1e-3);
+    TEST_ASSERT(result3D.size() == 1);
+    TEST_ASSERT(std::abs(result3D[0].centroid.z() - 1.5) < 1e-3);
+    TEST_ASSERT(std::abs(result3D[0].centroid.x() - 0.0) < 1e-3);
+    TEST_ASSERT(std::abs(result3D[0].centroid.y() - 0.0) < 1e-3);
 
-    assert(result3D[0].markers.size() == 1);
-    assert(result3D[0].markers[0].isStereo);
-    assert(std::abs(result3D[0].markers[0].position.y() - 0.021335) < 1e-3);
+    TEST_ASSERT(result3D[0].markers.size() == 1);
+    TEST_ASSERT(result3D[0].markers[0].isStereo);
+    TEST_ASSERT(std::abs(result3D[0].markers[0].position.y() - 0.021335) < 1e-3);
 
     // Let's test the single-camera ray-sphere fallback.
     // If the marker is only visible in Left camera, we remove it from Right:
     bR.markers.clear();
     auto resultSingle = solver.triangulateShot({ bL }, { bR });
-    assert(resultSingle.size() == 1);
-    assert(resultSingle[0].markers.size() == 1);
-    assert(!resultSingle[0].markers[0].isStereo);
-    assert(resultSingle[0].markers[0].confidence == 0.5);
+    TEST_ASSERT(resultSingle.size() == 1);
+    TEST_ASSERT(resultSingle[0].markers.size() == 1);
+    TEST_ASSERT(!resultSingle[0].markers[0].isStereo);
+    TEST_ASSERT(resultSingle[0].markers[0].confidence == 0.5);
     // The recovered position should be extremely close to (0.0, 0.021335, 1.5)
-    assert(std::abs(resultSingle[0].markers[0].position.y() - 0.021335) < 1e-3);
-    assert(std::abs(resultSingle[0].markers[0].position.z() - 1.5) < 1e-3);
+    TEST_ASSERT(std::abs(resultSingle[0].markers[0].position.y() - 0.021335) < 1e-3);
+    TEST_ASSERT(std::abs(resultSingle[0].markers[0].position.z() - 1.5) < 1e-3);
 
     // Test single-camera ray-sphere fallback for Right camera:
     // If marker is only visible in Right camera, remove it from Left:
     bL.markers.clear();
     bR.markers.push_back(mr);
     auto resultRightOnly = solver.triangulateShot({ bL }, { bR });
-    assert(resultRightOnly.size() == 1);
-    assert(resultRightOnly[0].markers.size() == 1);
-    assert(!resultRightOnly[0].markers[0].isStereo);
-    assert(resultRightOnly[0].markers[0].confidence == 0.5);
+    TEST_ASSERT(resultRightOnly.size() == 1);
+    TEST_ASSERT(resultRightOnly[0].markers.size() == 1);
+    TEST_ASSERT(!resultRightOnly[0].markers[0].isStereo);
+    TEST_ASSERT(resultRightOnly[0].markers[0].confidence == 0.5);
     // The recovered position in world (Left camera) coords must match (0.0, 0.021335, 1.5)
-    assert(std::abs(resultRightOnly[0].markers[0].position.x() - 0.0) < 1e-3);
-    assert(std::abs(resultRightOnly[0].markers[0].position.y() - 0.021335) < 1e-3);
-    assert(std::abs(resultRightOnly[0].markers[0].position.z() - 1.5) < 1e-3);
+    TEST_ASSERT(std::abs(resultRightOnly[0].markers[0].position.x() - 0.0) < 1e-3);
+    TEST_ASSERT(std::abs(resultRightOnly[0].markers[0].position.y() - 0.021335) < 1e-3);
+    TEST_ASSERT(std::abs(resultRightOnly[0].markers[0].position.z() - 1.5) < 1e-3);
 
     // Test Principal Motion Vector Trajectory Sorting:
     // Create a steep vertical launch shot (lob wedge):
@@ -265,16 +268,16 @@ void testStereoTriangulatorAndRaySphere() {
 
     // Pass them intentionally out-of-order: { p2, p0, p1 }
     auto steepTrajectory = solver.triangulateShot({ p2_L, p0_L, p1_L }, { p2_R, p0_R, p1_R });
-    assert(steepTrajectory.size() == 3);
+    TEST_ASSERT(steepTrajectory.size() == 3);
     // Principal motion vector projection must restore exact chronological order: p0 -> p1 -> p2
     // In world coordinates, +Y is down, so p0 (lowest) has highest Y, p2 (highest) has lowest Y.
-    assert(steepTrajectory[0].centroid.y() > steepTrajectory[1].centroid.y());
-    assert(steepTrajectory[1].centroid.y() > steepTrajectory[2].centroid.y());
+    TEST_ASSERT(steepTrajectory[0].centroid.y() > steepTrajectory[1].centroid.y());
+    TEST_ASSERT(steepTrajectory[1].centroid.y() > steepTrajectory[2].centroid.y());
 
     spdlog::info("[TEST] StereoTriangulator and Ray-Sphere Fallback verification passed.");
 }
 
-void testKinematicsEngine() {
+GOLFSIM_TEST(KinematicsEngine) {
     EigenBallisticsEngine engine;
 
     // Create a synthetic shot trajectory.
@@ -323,29 +326,27 @@ void testKinematicsEngine() {
     // Verify velocity and speed
     double expected_speed_mps = velocity.norm();
     double expected_speed_mph = expected_speed_mps * 2.236936;
-    assert(std::abs(data.ballSpeed.value() - expected_speed_mph) < 1e-2);
+    TEST_ASSERT(std::abs(data.ballSpeed.value() - expected_speed_mph) < 1e-2);
 
     // Verify launch angles using the corrected physical equations:
     // VLA = atan2(-vy, sqrt(vx^2 + vz^2))
     // HLA = atan2(vz, vx)
     double expected_vla = std::atan2(-velocity.y(), std::sqrt(velocity.x()*velocity.x() + velocity.z()*velocity.z())) * 180.0 / std::numbers::pi;
     double expected_hla = std::atan2(velocity.z(), velocity.x()) * 180.0 / std::numbers::pi;
-    assert(std::abs(data.verticalLaunchAngle.value() - expected_vla) < 1e-2);
-    assert(std::abs(data.horizontalLaunchAngle.value() - expected_hla) < 1e-2);
+    TEST_ASSERT(std::abs(data.verticalLaunchAngle.value() - expected_vla) < 1e-2);
+    TEST_ASSERT(std::abs(data.horizontalLaunchAngle.value() - expected_hla) < 1e-2);
 
     // Verify spin speed and axis (solver negates Y component of spin axis for world coords)
-    assert(std::abs(data.spinRPM - 3000.0) < 1.0);
+    TEST_ASSERT(std::abs(data.spinRPM - 3000.0) < 1.0);
     Eigen::Vector3d expected_world_spin_axis(axis.x(), -axis.y(), axis.z());
-    assert((data.spinAxis - expected_world_spin_axis.normalized()).norm() < 1e-3);
+    TEST_ASSERT((data.spinAxis - expected_world_spin_axis.normalized()).norm() < 1e-3);
 
     spdlog::info("[TEST] EigenBallisticsEngine verification passed.");
 }
 
-void testFlightRecorder() {
-    FlightRecorder recorder("build/replays_test");
-
-    // Clean up test dir if it exists
-    std::filesystem::remove_all("build/replays_test");
+GOLFSIM_TEST(FlightRecorder) {
+    const std::string testDir = TestSandbox::path("replays_test");
+    std::filesystem::remove_all(testDir);
 
     std::vector<RecordedFrame> frames;
     for (int i = 0; i < 12; ++i) {
@@ -388,35 +389,37 @@ void testFlightRecorder() {
     launchData.spinRPM = 3000.0;
     launchData.spinAxis = Eigen::Vector3d(0, 0, -1);
 
-    // Let's call saveSession 12 times to trigger limit rotation (which caps at 10)
-    for (int i = 0; i < 12; ++i) {
-        recorder.saveSession(frames, launchData);
-        // sleep a tiny bit to ensure distinct ms timestamps
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    // Call saveSession 12 times to trigger limit rotation (which caps at 10).
+    // The recorder is scoped so its destructor drains the async queue before
+    // we inspect the directory — deterministic, no sleep needed.
+    {
+        FlightRecorder recorder(testDir);
+        for (int i = 0; i < 12; ++i) {
+            recorder.saveSession(frames, launchData);
+            // sleep a tiny bit to ensure distinct ms timestamps in folder names
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
     }
 
-    // Wait for async worker thread to finish writing files
-    std::this_thread::sleep_for(std::chrono::milliseconds(800));
-
-    // Check that we have exactly 10 directories in build/replays_test starting with shot_
+    // Check that we have exactly 10 directories starting with shot_
     int count = 0;
-    for (const auto& entry : std::filesystem::directory_iterator("build/replays_test")) {
+    for (const auto& entry : std::filesystem::directory_iterator(testDir)) {
         if (entry.is_directory() && entry.path().filename().string().rfind("shot_", 0) == 0) {
             count++;
             // Check that subdirectories raw/ and annotated/ and metadata.json exist
-            assert(std::filesystem::exists(entry.path() / "raw"));
-            assert(std::filesystem::exists(entry.path() / "annotated"));
-            assert(std::filesystem::exists(entry.path() / "metadata.json"));
+            TEST_ASSERT(std::filesystem::exists(entry.path() / "raw"));
+            TEST_ASSERT(std::filesystem::exists(entry.path() / "annotated"));
+            TEST_ASSERT(std::filesystem::exists(entry.path() / "metadata.json"));
         }
     }
-    assert(count == 10);
+    TEST_ASSERT(count == 10);
 
     // Clean up
-    std::filesystem::remove_all("build/replays_test");
+    std::filesystem::remove_all(testDir);
     spdlog::info("[TEST] FlightRecorder verification passed.");
 }
 
-void testStereoBallTrackerTrigger() {
+GOLFSIM_TEST(StereoBallTrackerTrigger) {
     StereoCalibration calib;
     calib.K_L = cv::Mat_<double>({3, 3}, {1000.0, 0.0, 640.0, 0.0, 1000.0, 400.0, 0.0, 0.0, 1.0});
     calib.D_L = cv::Mat::zeros(1, 5, CV_64F);
@@ -452,22 +455,22 @@ void testStereoBallTrackerTrigger() {
 
     for (int i = 0; i < 6; ++i) {
         bool trigFar = trigger.checkTrigger(farFrameL, farFrameR);
-        assert(!trigFar);
-        assert(trigger.getState() == StereoTriggerState::SEARCHING);
+        TEST_ASSERT(!trigFar);
+        TEST_ASSERT(trigger.getState() == StereoTriggerState::SEARCHING);
     }
 
     // 1. Test SEARCHING -> ARMED Transition (Requires 5 consecutive stable frames)
     for (int i = 0; i < 4; ++i) {
         bool trigSearch = trigger.checkTrigger(frameL, frameR);
-        assert(!trigSearch);
-        assert(trigger.getState() == StereoTriggerState::SEARCHING);
+        TEST_ASSERT(!trigSearch);
+        TEST_ASSERT(trigger.getState() == StereoTriggerState::SEARCHING);
     }
     // 5th frame transitions state to ARMED
     bool trigArmed = trigger.checkTrigger(frameL, frameR);
-    assert(!trigArmed);
-    assert(trigger.getState() == StereoTriggerState::ARMED);
+    TEST_ASSERT(!trigArmed);
+    TEST_ASSERT(trigger.getState() == StereoTriggerState::ARMED);
     auto pos3D = trigger.getLastKnown3DPosition();
-    assert(std::abs(pos3D.z() - 0.6) < 0.02);
+    TEST_ASSERT(std::abs(pos3D.z() - 0.6) < 0.02);
 
     // 2. Test SINGLE-CAMERA OCCLUSION IMMUNITY (hand behind ball)
     cv::Mat occludedFrameL = frameL.clone();
@@ -475,24 +478,24 @@ void testStereoBallTrackerTrigger() {
     cv::Mat blankFrameR = cv::Mat::zeros(800, 1280, CV_8UC1);
 
     bool trigOcc = trigger.checkTrigger(occludedFrameL, blankFrameR);
-    assert(!trigOcc);
-    assert(trigger.getState() == StereoTriggerState::ARMED);
+    TEST_ASSERT(!trigOcc);
+    TEST_ASSERT(trigger.getState() == StereoTriggerState::ARMED);
 
     // 3. Test DUAL-CAMERA LOSS GRACE WINDOW
     for (int i = 0; i < 3; ++i) {
         bool trigGrace = trigger.checkTrigger(blankFrameR, blankFrameR);
-        assert(!trigGrace);
-        assert(trigger.getState() == StereoTriggerState::ARMED);
+        TEST_ASSERT(!trigGrace);
+        TEST_ASSERT(trigger.getState() == StereoTriggerState::ARMED);
     }
     bool trigReset = trigger.checkTrigger(blankFrameR, blankFrameR);
-    assert(!trigReset);
-    assert(trigger.getState() == StereoTriggerState::SEARCHING);
+    TEST_ASSERT(!trigReset);
+    TEST_ASSERT(trigger.getState() == StereoTriggerState::SEARCHING);
 
     // Re-lock ball to ARMED (requires 5 frames)
     for (int i = 0; i < 5; ++i) {
         trigger.checkTrigger(frameL, frameR);
     }
-    assert(trigger.getState() == StereoTriggerState::ARMED);
+    TEST_ASSERT(trigger.getState() == StereoTriggerState::ARMED);
 
     // 4. Test VIBRATION / NUDGE REJECTION
     // Displace ball slightly by 45 mm (beyond 40 mm threshold), but low speed (0.5 m/s)
@@ -503,14 +506,14 @@ void testStereoBallTrackerTrigger() {
     cv::circle(nudgeR, cv::Point(548, 400), 35, cv::Scalar(200), -1);
 
     bool trigNudge = trigger.checkTrigger(nudgeL, nudgeR);
-    assert(!trigNudge);
-    assert(trigger.getState() == StereoTriggerState::CONFIRMING);
+    TEST_ASSERT(!trigNudge);
+    TEST_ASSERT(trigger.getState() == StereoTriggerState::CONFIRMING);
 
     for (int i = 0; i < 3; ++i) {
         bool trigConfirm = trigger.checkTrigger(nudgeL, nudgeR);
-        assert(!trigConfirm);
+        TEST_ASSERT(!trigConfirm);
     }
-    assert(trigger.getState() == StereoTriggerState::ARMED);
+    TEST_ASSERT(trigger.getState() == StereoTriggerState::ARMED);
 
     // 5. Test VALID HIGH-VELOCITY IMPACT TRIGGER
     // Displace ball at launch speed 40 m/s (~90 mph)
@@ -520,8 +523,8 @@ void testStereoBallTrackerTrigger() {
     cv::circle(launchR, cv::Point(633, 400), 35, cv::Scalar(200), -1);
 
     bool trigImpact1 = trigger.checkTrigger(launchL, launchR);
-    assert(!trigImpact1);
-    assert(trigger.getState() == StereoTriggerState::CONFIRMING);
+    TEST_ASSERT(!trigImpact1);
+    TEST_ASSERT(trigger.getState() == StereoTriggerState::CONFIRMING);
 
     cv::Mat launchL2 = cv::Mat::zeros(800, 1280, CV_8UC1);
     cv::Mat launchR2 = cv::Mat::zeros(800, 1280, CV_8UC1);
@@ -529,37 +532,37 @@ void testStereoBallTrackerTrigger() {
     cv::circle(launchR2, cv::Point(733, 400), 35, cv::Scalar(200), -1);
 
     bool trigImpact2 = trigger.checkTrigger(launchL2, launchR2);
-    assert(trigImpact2);
-    assert(trigger.getState() == StereoTriggerState::CAPTURED);
+    TEST_ASSERT(trigImpact2);
+    TEST_ASSERT(trigger.getState() == StereoTriggerState::CAPTURED);
 
     // 6. Test STANDBY EMITTER PROTECTION (Dynamic Photobiological Safety)
     trigger.reset();
-    assert(trigger.getEmitterMode() == EmitterPowerMode::HIGH_STROBE_READY);
-    assert(!trigger.isStandbyRequested());
+    TEST_ASSERT(trigger.getEmitterMode() == EmitterPowerMode::HIGH_STROBE_READY);
+    TEST_ASSERT(!trigger.isStandbyRequested());
 
     // Set fast test timeout (50ms)
     trigger.setLossTimeoutSec(0.05);
     trigger.checkTrigger(blankFrameR, blankFrameR); // Starts empty timer
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
     trigger.checkTrigger(blankFrameR, blankFrameR); // Triggers transition to LOW_STANDBY
-    assert(trigger.getEmitterMode() == EmitterPowerMode::LOW_STANDBY);
-    assert(trigger.isStandbyRequested());
+    TEST_ASSERT(trigger.getEmitterMode() == EmitterPowerMode::LOW_STANDBY);
+    TEST_ASSERT(trigger.isStandbyRequested());
 
     // Placing ball back on tee restores HIGH_STROBE_READY
     trigger.checkTrigger(frameL, frameR);
-    assert(trigger.getEmitterMode() == EmitterPowerMode::HIGH_STROBE_READY);
-    assert(!trigger.isStandbyRequested());
+    TEST_ASSERT(trigger.getEmitterMode() == EmitterPowerMode::HIGH_STROBE_READY);
+    TEST_ASSERT(!trigger.isStandbyRequested());
 
     spdlog::info("[TEST] StereoBallTrackerTrigger verification passed (including dynamic emitter protection).");
 }
 
-void testAtomicRingBufferOverwrite() {
+GOLFSIM_TEST(AtomicRingBufferOverwrite) {
     AtomicRingBuffer<FrameSet, 16> ringBuffer;
     ringBuffer.preallocate(100, 100);
 
-    assert(ringBuffer.empty());
-    assert(ringBuffer.size() == 0);
-    assert(ringBuffer.capacity() == 15);
+    TEST_ASSERT(ringBuffer.empty());
+    TEST_ASSERT(ringBuffer.size() == 0);
+    TEST_ASSERT(ringBuffer.capacity() == 15);
 
     // 1. Test basic push and pop
     FrameSet pushFrame;
@@ -567,17 +570,17 @@ void testAtomicRingBufferOverwrite() {
     pushFrame.timestamp = 1001;
 
     ringBuffer.push(pushFrame);
-    assert(!ringBuffer.empty());
-    assert(ringBuffer.size() == 1);
+    TEST_ASSERT(!ringBuffer.empty());
+    TEST_ASSERT(ringBuffer.size() == 1);
 
     FrameSet popFrame;
     popFrame.preallocate(100, 100);
     bool popSuccess = ringBuffer.pop(popFrame);
-    assert(popSuccess);
-    assert(popFrame.timestamp == 1001);
-    assert(popFrame.getFrame(CameraRole::STEREO_LEFT).rows == 100);
-    assert(popFrame.getFrame(CameraRole::STEREO_LEFT).cols == 100);
-    assert(ringBuffer.empty());
+    TEST_ASSERT(popSuccess);
+    TEST_ASSERT(popFrame.timestamp == 1001);
+    TEST_ASSERT(popFrame.getFrame(CameraRole::STEREO_LEFT).rows == 100);
+    TEST_ASSERT(popFrame.getFrame(CameraRole::STEREO_LEFT).cols == 100);
+    TEST_ASSERT(ringBuffer.empty());
 
     // 2. Test overwrite semantics (pushing 30 items into capacity 15 buffer)
     for (uint64_t i = 0; i < 30; ++i) {
@@ -588,7 +591,7 @@ void testAtomicRingBufferOverwrite() {
     }
 
     // Since capacity is 15, size should be <= 15
-    assert(ringBuffer.size() <= 15);
+    TEST_ASSERT(ringBuffer.size() <= 15);
 
     // Drain and verify monotonic increasing timestamps and no corrupted frames
     uint64_t lastTimestamp = 0;
@@ -596,17 +599,17 @@ void testAtomicRingBufferOverwrite() {
     FrameSet drainedFrame;
     drainedFrame.preallocate(100, 100);
     while (ringBuffer.pop(drainedFrame)) {
-        assert(drainedFrame.getFrame(CameraRole::STEREO_LEFT).rows == 100);
-        assert(drainedFrame.getFrame(CameraRole::STEREO_RIGHT).cols == 100);
+        TEST_ASSERT(drainedFrame.getFrame(CameraRole::STEREO_LEFT).rows == 100);
+        TEST_ASSERT(drainedFrame.getFrame(CameraRole::STEREO_RIGHT).cols == 100);
         if (drainedCount > 0) {
-            assert(drainedFrame.timestamp > lastTimestamp);
+            TEST_ASSERT(drainedFrame.timestamp > lastTimestamp);
         }
         lastTimestamp = drainedFrame.timestamp;
         drainedCount++;
     }
-    assert(drainedCount <= 15);
-    assert(drainedCount > 0);
-    assert(lastTimestamp == 29);
+    TEST_ASSERT(drainedCount <= 15);
+    TEST_ASSERT(drainedCount > 0);
+    TEST_ASSERT(lastTimestamp == 29);
 
     // 3. High-Concurrency Stress Test: 20,000 frames pushed by fast producer
     std::atomic<bool> producerDone{false};
@@ -631,10 +634,10 @@ void testAtomicRingBufferOverwrite() {
             if (ringBuffer.pop(consFrame)) {
                 framesPopped++;
                 // Verify memory integrity: matrices must remain 100x100 and valid
-                assert(!consFrame.getFrame(CameraRole::STEREO_LEFT).empty());
-                assert(consFrame.getFrame(CameraRole::STEREO_LEFT).rows == 100);
-                assert(consFrame.getFrame(CameraRole::STEREO_LEFT).cols == 100);
-                assert(consFrame.timestamp > prevTs);
+                TEST_ASSERT(!consFrame.getFrame(CameraRole::STEREO_LEFT).empty());
+                TEST_ASSERT(consFrame.getFrame(CameraRole::STEREO_LEFT).rows == 100);
+                TEST_ASSERT(consFrame.getFrame(CameraRole::STEREO_LEFT).cols == 100);
+                TEST_ASSERT(consFrame.timestamp > prevTs);
                 prevTs = consFrame.timestamp;
             } else {
                 std::this_thread::yield();
@@ -645,16 +648,14 @@ void testAtomicRingBufferOverwrite() {
     producer.join();
     consumer.join();
 
-    assert(framesPopped > 0);
+    TEST_ASSERT(framesPopped > 0);
     spdlog::info("[TEST] AtomicRingBuffer overwrite verification passed (popped {}/{} frames under heavy contention).",
                  framesPopped.load(), TOTAL_PRODUCE);
 }
 
-void testAsyncFlightRecorderStream() {
-    std::string testDir = "build/stream_test";
+GOLFSIM_TEST(AsyncFlightRecorderStream) {
+    const std::string testDir = TestSandbox::path("stream_test");
     std::filesystem::remove_all(testDir);
-
-    FlightRecorder recorder(testDir);
 
     std::vector<RecordedFrame> streamFrames;
     for (int i = 0; i < 20; ++i) {
@@ -668,107 +669,60 @@ void testAsyncFlightRecorderStream() {
         streamFrames.push_back(f);
     }
 
-    auto start = std::chrono::steady_clock::now();
-    recorder.saveStreamSession(streamFrames);
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - start);
+    std::chrono::microseconds duration{};
+    {
+        FlightRecorder recorder(testDir);
+        auto start = std::chrono::steady_clock::now();
+        recorder.saveStreamSession(streamFrames);
+        duration = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start);
+    }   // destructor drains the worker queue: files are on disk here
 
     // saveStreamSession must be asynchronous: return immediately (< 10 ms)
     spdlog::info("[TEST] saveStreamSession non-blocking latency: {} us", duration.count());
-    assert(duration.count() < 10000); // Less than 10 ms
-
-    // Wait for background worker to complete writing files
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    TEST_ASSERT(duration.count() < 10000); // Less than 10 ms
 
     // Verify stream folder and contents
     bool foundStreamDir = false;
     for (const auto& entry : std::filesystem::directory_iterator(testDir)) {
         if (entry.is_directory() && entry.path().filename().string().rfind("stream_", 0) == 0) {
             foundStreamDir = true;
-            assert(std::filesystem::exists(entry.path() / "raw"));
-            assert(std::filesystem::exists(entry.path() / "annotated"));
-            assert(std::filesystem::exists(entry.path() / "metadata.json"));
+            TEST_ASSERT(std::filesystem::exists(entry.path() / "raw"));
+            TEST_ASSERT(std::filesystem::exists(entry.path() / "annotated"));
+            TEST_ASSERT(std::filesystem::exists(entry.path() / "metadata.json"));
 
             // Check that left and right PNGs exist
-            assert(std::filesystem::exists(entry.path() / "raw" / "left_000.png"));
-            assert(std::filesystem::exists(entry.path() / "raw" / "right_000.png"));
+            TEST_ASSERT(std::filesystem::exists(entry.path() / "raw" / "left_000.png"));
+            TEST_ASSERT(std::filesystem::exists(entry.path() / "raw" / "right_000.png"));
         }
     }
-    assert(foundStreamDir);
+    TEST_ASSERT(foundStreamDir);
 
     std::filesystem::remove_all(testDir);
     spdlog::info("[TEST] Async FlightRecorder stream verification passed.");
 }
 
-// Mock components for testing SessionStateMachine in isolation
-struct MockStrobeTrigger {
-    static inline bool fireOnNext = false;
-    bool checkTrigger(const cv::Mat&, const cv::Mat&) {
-        if (fireOnNext) {
-            fireOnNext = false;
-            return true;
-        }
-        return false;
-    }
-    void reset() { fireOnNext = false; }
-};
+GOLFSIM_TEST(SessionStateMachineStroboscopicTiming) {
+    // Solved mock shots are recorded under the sandbox, never build/replays
+    const std::string ssmReplayDir   = TestSandbox::path("ssm_replays");
+    const std::string ssmHistoryPath = TestSandbox::path("ssm_shot_history.json");
+    std::filesystem::remove_all(ssmReplayDir);
+    std::filesystem::remove(ssmHistoryPath);
 
-struct MockStrobeVision : public IComputerVision {
-    static inline std::vector<BallObservation> returnObs;
-    std::vector<BallObservation> detectBalls(const cv::Mat&) override {
-        return returnObs;
-    }
-};
-
-struct MockStrobeSpatial : public ISpatialSolver {
-    static inline std::vector<Ball3D> returnBalls;
-    std::vector<Ball3D> triangulateShot(
-        const std::vector<BallObservation>&,
-        const std::vector<BallObservation>&
-    ) override {
-        return returnBalls;
-    }
-};
-
-struct MockStrobeKinematics : public IKinematicsSolver {
-    static inline double lastPulseIntervalMs = 0.0;
-    static inline size_t lastTrajectorySize = 0;
-    LaunchData<Degrees, MilesPerHour> solveKinematics(const std::vector<Ball3D>& trajectory, double pulseIntervalMs) override {
-        lastTrajectorySize = trajectory.size();
-        lastPulseIntervalMs = pulseIntervalMs;
-        LaunchData<Degrees, MilesPerHour> ld;
-        ld.ballSpeed = MilesPerHour(85.0);
-        ld.verticalLaunchAngle = Degrees(14.0);
-        ld.horizontalLaunchAngle = Degrees(1.0);
-        ld.spinRPM = 6500.0;
-        ld.spinAxis = Eigen::Vector3d(0, 1, 0);
-        return ld;
-    }
-};
-
-struct MockStrobeNet : public INetworkTransmitter {
-    static inline bool transmitted = false;
-    bool transmitLaunchData(const LaunchData<Degrees, MilesPerHour>&) override {
-        transmitted = true;
-        return true;
-    }
-};
-
-void testSessionStateMachineStroboscopicTiming() {
     // 1. Verify 3.0 ft default geometry in PipelineTimingConfig
     PipelineTimingConfig config;
-    assert(std::abs(config.workingDistanceMeters - 0.9144) < 1e-4);
-    assert(std::abs(config.pulseIntervalMs - 3.3333) < 1e-3);
-    assert(config.minPointsToSolve == 3);
-    assert(config.maxFramesPerShot == 2);
-    assert(config.emptyFrameTimeout == 1);
-    assert(std::abs(config.nominalBallRadiusPx - 23.3) < 0.1);
-    assert(config.highStrobeRateHz == 300.0);
-    assert(config.standbyStrobeRateHz == 10.0);
-    assert(config.cameraExposureUs == 10000);
-    assert(config.strobePulseCount == 3);
-    assert(config.ballLossTimeoutSec == 5.0);
-    assert(config.isValidTiming());
+    TEST_ASSERT(std::abs(config.workingDistanceMeters - 0.9144) < 1e-4);
+    TEST_ASSERT(std::abs(config.pulseIntervalMs - 3.3333) < 1e-3);
+    TEST_ASSERT(config.minPointsToSolve == 3);
+    TEST_ASSERT(config.maxFramesPerShot == 2);
+    TEST_ASSERT(config.emptyFrameTimeout == 1);
+    TEST_ASSERT(std::abs(config.nominalBallRadiusPx - 23.3) < 0.1);
+    TEST_ASSERT(config.highStrobeRateHz == 300.0);
+    TEST_ASSERT(config.standbyStrobeRateHz == 10.0);
+    TEST_ASSERT(config.cameraExposureUs == 10000);
+    TEST_ASSERT(config.strobePulseCount == 3);
+    TEST_ASSERT(config.ballLossTimeoutSec == 5.0);
+    TEST_ASSERT(config.isValidTiming());
 
     // Helper to generate a dummy FrameSet
     auto makeFrameSet = []() {
@@ -805,7 +759,7 @@ void testSessionStateMachineStroboscopicTiming() {
         MockStrobeNet net;
 
         SessionStateMachine<MockStrobeTrigger, MockStrobeVision, MockStrobeSpatial, MockStrobeKinematics, MockStrobeNet>
-            ssm(trig, vis, spat, kin, net, config);
+            ssm(trig, vis, spat, kin, net, config, ssmReplayDir, ssmHistoryPath);
 
         // Frame 0: Trigger fires! Vision finds 5 pulses
         MockStrobeTrigger::fireOnNext = true;
@@ -813,7 +767,7 @@ void testSessionStateMachineStroboscopicTiming() {
         MockStrobeSpatial::returnBalls = makeBalls(5);
 
         ssm.processNextFrame(makeFrameSet());
-        assert(!MockStrobeNet::transmitted); // In-flight, waiting to confirm completion
+        TEST_ASSERT(!MockStrobeNet::transmitted); // In-flight, waiting to confirm completion
 
         // Frame 1: Ball has exited FOV! Vision finds 0 pulses
         MockStrobeVision::returnObs.clear();
@@ -821,9 +775,9 @@ void testSessionStateMachineStroboscopicTiming() {
 
         ssm.processNextFrame(makeFrameSet());
         // With emptyFrameTimeout = 1, it must solve IMMEDIATELY without waiting 15 frames!
-        assert(MockStrobeNet::transmitted);
-        assert(MockStrobeKinematics::lastTrajectorySize == 5);
-        assert(std::abs(MockStrobeKinematics::lastPulseIntervalMs - 3.3333) < 1e-3);
+        TEST_ASSERT(MockStrobeNet::transmitted);
+        TEST_ASSERT(MockStrobeKinematics::lastTrajectorySize == 5);
+        TEST_ASSERT(std::abs(MockStrobeKinematics::lastPulseIntervalMs - 3.3333) < 1e-3);
     }
 
     // 3. Test Case 2: 2-Frame Hybrid Accumulation for Irons (Frame 1 + Frame 2)
@@ -842,21 +796,21 @@ void testSessionStateMachineStroboscopicTiming() {
         MockStrobeNet net;
 
         SessionStateMachine<MockStrobeTrigger, MockStrobeVision, MockStrobeSpatial, MockStrobeKinematics, MockStrobeNet>
-            ssm(trig, vis, spat, kin, net, config);
+            ssm(trig, vis, spat, kin, net, config, ssmReplayDir, ssmHistoryPath);
 
         // Frame 0: Trigger fires! 5 pulses captured in Frame 1
         MockStrobeTrigger::fireOnNext = true;
         MockStrobeVision::returnObs.resize(5);
         MockStrobeSpatial::returnBalls = makeBalls(5);
         ssm.processNextFrame(makeFrameSet());
-        assert(!MockStrobeNet::transmitted);
+        TEST_ASSERT(!MockStrobeNet::transmitted);
 
         // Frame 1: Ball still in FOV! 5 more pulses captured in Frame 2
         ssm.processNextFrame(makeFrameSet());
         // Frame limit reached (shotFrameCount == maxFramesPerShot == 2) -> solves across 10 points!
-        assert(MockStrobeNet::transmitted);
-        assert(MockStrobeKinematics::lastTrajectorySize == 10);
-        assert(std::abs(MockStrobeKinematics::lastPulseIntervalMs - 3.3333) < 1e-3);
+        TEST_ASSERT(MockStrobeNet::transmitted);
+        TEST_ASSERT(MockStrobeKinematics::lastTrajectorySize == 10);
+        TEST_ASSERT(std::abs(MockStrobeKinematics::lastPulseIntervalMs - 3.3333) < 1e-3);
     }
 
     // 4. Test Case 3: Custom Timing Configuration (pulseIntervalMs = 0.8, minPointsToSolve = 4)
@@ -881,7 +835,7 @@ void testSessionStateMachineStroboscopicTiming() {
         MockStrobeNet net;
 
         SessionStateMachine<MockStrobeTrigger, MockStrobeVision, MockStrobeSpatial, MockStrobeKinematics, MockStrobeNet>
-            ssm(trig, vis, spat, kin, net, customConfig);
+            ssm(trig, vis, spat, kin, net, customConfig, ssmReplayDir, ssmHistoryPath);
 
         MockStrobeTrigger::fireOnNext = true;
         MockStrobeVision::returnObs.resize(4);
@@ -889,17 +843,17 @@ void testSessionStateMachineStroboscopicTiming() {
 
         ssm.processNextFrame(makeFrameSet());
         // maxFramesPerShot == 1 reached immediately!
-        assert(MockStrobeNet::transmitted);
-        assert(MockStrobeKinematics::lastTrajectorySize == 4);
-        assert(std::abs(MockStrobeKinematics::lastPulseIntervalMs - 0.8) < 1e-4);
+        TEST_ASSERT(MockStrobeNet::transmitted);
+        TEST_ASSERT(MockStrobeKinematics::lastTrajectorySize == 4);
+        TEST_ASSERT(std::abs(MockStrobeKinematics::lastPulseIntervalMs - 0.8) < 1e-4);
     }
 
     spdlog::info("[TEST] SessionStateMachine stroboscopic timing and 3.0 ft geometry verification passed.");
 }
 
-void testSerialPort() {
+GOLFSIM_TEST(SerialPort) {
     SerialPort serial;
-    assert(!serial.isOpen());
+    TEST_ASSERT(!serial.isOpen());
 
     // Test retry connection failure on non-existent port (2 retries = 3 total attempts)
     // Use short delay (20 ms) to keep unit test runtime snappy (<100 ms total)
@@ -909,36 +863,14 @@ void testSerialPort() {
     std::string fakePort = "/dev/tty_nonexistent_golfsim_test";
 #endif
     bool success = serial.openWithRetry(fakePort, 115200, 2, 20);
-    assert(!success);
-    assert(!serial.isOpen());
+    TEST_ASSERT(!success);
+    TEST_ASSERT(!serial.isOpen());
 
     // Operations on unopened/failed port must fail gracefully without throwing or crashing
-    assert(!serial.writeChar('H'));
-    assert(!serial.writeString("TEST"));
+    TEST_ASSERT(!serial.writeChar('H'));
+    TEST_ASSERT(!serial.writeString("TEST"));
     serial.flush();
     serial.close();
 
     spdlog::info("[TEST] SerialPort retry resilience and graceful degradation passed.");
-}
-
-void runMathTests() {
-    spdlog::info("============================================");
-    spdlog::info("Starting C++ Math Verification Tests...");
-    spdlog::info("============================================");
-
-    testUnits();
-    testBallPresenceTrigger();
-    testStereoBallTrackerTrigger();
-    testOpenCVMomentsTracker();
-    testStereoTriangulatorAndRaySphere();
-    testKinematicsEngine();
-    testFlightRecorder();
-    testAtomicRingBufferOverwrite();
-    testAsyncFlightRecorderStream();
-    testSessionStateMachineStroboscopicTiming();
-    testSerialPort();
-
-    spdlog::info("============================================");
-    spdlog::info("All C++ Math Verification Tests PASSED!");
-    spdlog::info("============================================");
 }

@@ -41,6 +41,42 @@ cmake -B build -S .
 cmake --build build
 ```
 
+### Running Tests
+
+Tests live in `tests/` and build into a separate `GolfSimTests` runner (never into `GolfSim`). Every case is registered with CTest individually.
+
+```bash
+cmake --build build
+ctest --test-dir build --output-on-failure      # all cases + the separation guards
+ctest --test-dir build -R Kinematics            # one case by name
+./build/GolfSimTests --list                     # case names
+./build/GolfSimTests --filter Recorder          # substring match
+./build/GolfSimTests --verbose Units            # show info-level log output from the code under test
+```
+
+Windows uses a multi-config generator, so pass the configuration to ctest:
+
+```powershell
+& $cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
+
+All test filesystem output goes under `build/test_sandbox/`; `build/replays/` and `build/shot_history.json` are never touched by tests. Set `-DGOLFSIM_BUILD_TESTS=OFF` to skip the test target entirely.
+
+### Coverage
+
+Coverage uses Clang + `llvm-cov` (line, region/statement, branch and MC/DC) in a separate Debug build tree. `tools/coverage/thresholds.json` holds the ratchet: raise it whenever tests are added, never lower it.
+
+```bash
+cmake -B build-cov -S . -G Ninja -DCMAKE_BUILD_TYPE=Debug -DGOLFSIM_COVERAGE=ON \
+      -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build build-cov --target coverage       # runs ctest instrumented, writes the report, checks thresholds
+xdg-open build-cov/coverage-html/index.html
+ctest --test-dir build-cov -R CoverageGate      # re-check the last report against thresholds.json
+```
+
+GCC is also accepted by `GOLFSIM_COVERAGE` (gcov + `-fcondition-coverage`) as a cross-check; report it with `gcovr --exclude-throw-branches` (`sudo pacman -S gcovr`). Exclusion markers (`// LCOV_EXCL_LINE`, `LCOV_EXCL_START/STOP`, each with a reason) are honoured by the gate for lines and branches and are capped at 2 % of gated lines.
+
 ### Linux Device Permissions (one-time)
 
 | Device | Group | Notes |
