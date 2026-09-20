@@ -166,6 +166,17 @@ The timing model assumes 100 FPS, but the live viewer reports **30.3 FPS at a 20
 
 **Measured (2026-09-19, Windows rig).** Each OV9281 advertises 78 native types. At 1280×800: `NV12` and `MJPG` at **10, 15, 30, 60, 100 and 120 fps**. The old driver took index `[0]` = `NV12 @ 30 fps`, which is exactly the 30.3 fps the viewer showed. The new selection picks `NV12 1280x800 @ 100 fps` for the default target and both cameras negotiate it. The *delivered* rate could not be pinned down here: measured from recorded-frame timestamps in a **Debug** build with debug OpenCV, the 60 fps mode gave a clean 61 fps (camera-bound), while the 100 and 120 fps modes gave anything from 57 to 106 fps run to run — that is the consumer thread (finder ×2, vision ×2, JSON diagnostics, PNG writes) saturating, not the camera. Measure it with the live viewer's FPS counter in a Release build before trusting a number; `targetFps` stays at 100.
 
+**Measured again (2026-09-20, Windows rig, Release build against real OpenCV 5.0.0).** Resolved: the pair delivers 100 fps end to end. `tools/bench/CameraBench.cpp` (target `CameraBench`) runs `grabRawFrame()` with nothing downstream and reports wall-clock rate, per-read latency and the spacing of the driver's own sample timestamps:
+
+| Mode (500 frames, NV12 1280×800) | Delivered | Timestamp spacing | Dropped |
+|---|---|---|---|
+| each camera alone, 100 fps request | 100.9 fps | 9908 µs median | 0 |
+| both open, sequential L then R (production pattern) | 100.9 pairs/s | L read 0.6 ms, R read 9.3 ms | 0 |
+| both open, one thread each | 100.9 fps each | 9908 µs median | 0 |
+| both open, sequential, 120 fps request | 120.6 pairs/s | — | 0 |
+
+The sequential `ReadSample` suspicion is cleared: the left frame is already queued while the right read absorbs the wait, so the pair costs one period, not two. The production pipeline also keeps up: `GolfSim.exe --stream --frames 200` in Release recorded 200-frame chunks at **101.4 fps with zero ring-buffer overwrites** (max inter-frame gap 10.5 ms). The only gap is a single 545 ms pause between frame 0 and frame 1 of the first chunk — a Media Foundation stream-start artefact, not steady state. The earlier 57–106 fps spread was entirely the Debug build. Note for stream mode only: the async recorder writes a 200-frame chunk (800 PNGs) in ~4.2 s against 2 s of capture, so its queue (deep clones, ~400 MB per chunk) grows without bound for the length of the session.
+
 ### 2.6 Wiring
 
 - `main.cpp`: after both drivers initialise (production and `--stream` paths), call `node->applyConfig(appConfig.camera)` on each node. Log the applied exposure, gain and negotiated FPS for both cameras.
@@ -363,8 +374,8 @@ Steps 1, 2, 3, 5, 6 and 7 are done; step 4 needs the ball and emitter; step 8 is
 
 - **Ambient at 7812 µs.** Going from 2000 µs to 7812 µs lets in ~4× the ambient while the dots stay the same brightness. Whether gain 0 plus a higher intensity threshold is enough, or whether an 850 nm bandpass filter on the lenses is needed to kill ambient, is answered by the first sweep at 7812 µs (§4 step 4). Fall-back is 3906 µs / 2 pulses (§2.2).
 - **Disparity sign.** `xL − xR = −164` in the screenshot. If the sweep confirms it, `swapCameras = true` is the fix; if it flips depending on where the ball sits, the rig is toed-in and needs a real `StereoCalibration`.
-- **Does the camera advertise 100 FPS at 1280×800?** Yes — `NV12` at 100 and 120 fps (§2.5, measured). What remains open is what the *pair* sustains end to end; the Debug-build numbers were consumer-bound. Measure in Release with the viewer's FPS counter. If it falls short, the first suspects are the sequential blocking `ReadSample` in `captureSynchronizedFrames` and the per-frame JSON diagnostics in stream mode.
-- **Windows build.** The tree has required OpenCV 5 since the Sep 5 refactor, but this machine only has vcpkg OpenCV 4.7, so `build/GolfSim.exe` predates every change since. `CMakeLists.txt` now defines `NOMINMAX` on Windows (it did not compile at all without it). A Windows OpenCV 5 install, or a documented Linux-only build, is needed before the exe in `build/` means anything.
+- **Does the camera advertise 100 FPS at 1280×800?** Yes — `NV12` at 100 and 120 fps (§2.5, measured). **Resolved 2026-09-20:** the pair sustains 100.9 pairs/s with the production read pattern and the Release pipeline records at 101.4 fps with no overwrites (§2.5, second measurement). The sequential `ReadSample` is not a cost. Re-measure with `CameraBench` after any driver change.
+- **Windows build.** ~~The tree has required OpenCV 5 since the Sep 5 refactor, but this machine only has vcpkg OpenCV 4.7.~~ **Resolved 2026-09-20:** vcpkg has no 5.x port, so OpenCV 5.0.0 is built from source (static, `/MD`, Release + Debug, modules core/imgproc/imgcodecs/highgui/videoio/geometry/stereo/calib) and installed at `C:/opencv5`; `CMakePresets.json` (git-ignored) points `OpenCV_DIR` at `C:/opencv5/x64/vc17/staticlib` and adds a `release` preset (`build-release/`). `opencv4` is gone from `vcpkg.json`. `DotClusterFinder.cpp` needed `<opencv2/geometry.hpp>` — `moments`/`contourArea`/`boundingRect` live there in 5.x — which the 4.7 shim had hidden. 17/17 tests pass in Release against real 5.0.0.
 
 ---
 

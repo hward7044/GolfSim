@@ -69,6 +69,13 @@ add_executable(GolfSim src/main.cpp)
 target_link_libraries(GolfSim PRIVATE golfsim_core)
 
 # -----------------------------------------------------------------------------
+# Camera delivery benchmark (tools/bench/CameraBench.cpp): measures the raw
+# driver frame rate with nothing downstream. Build Release before trusting it.
+# -----------------------------------------------------------------------------
+add_executable(CameraBench tools/bench/CameraBench.cpp)
+target_link_libraries(CameraBench PRIVATE golfsim_core)
+
+# -----------------------------------------------------------------------------
 # Coverage instrumentation (Phase C0 of docs/refactor/07_Test_Infrastructure_Plan.md)
 # Clang: source-based coverage with regions, branches and MC/DC -> llvm-cov.
 # GCC:   gcov with condition (MC/DC) coverage -> gcovr, used as a cross-check.

@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/geometry.hpp>  // moments / contourArea / boundingRect live here in OpenCV 5
 
 // =============================================================================
 // DotClusterConfig

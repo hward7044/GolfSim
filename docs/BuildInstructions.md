@@ -25,6 +25,23 @@ $cmake = "C:\Program Files\Microsoft Visual Studio\2022\Professional\Common7\IDE
 
 *Note: If files are added or deleted, make sure to re-run the configure preset (`--preset default`) before building.*
 
+### OpenCV 5 on Windows
+
+vcpkg has no OpenCV 5 port (its `opencv4` port is 4.12), and the tree needs the 5.x-only `geometry`/`stereo`/`calib` modules, so OpenCV 5.0.0 is built from source and installed at `C:\opencv5` (static libs, `/MD` CRT to match the vcpkg dynamic triplet, Release + Debug, IPP on, modules `core,imgproc,imgcodecs,highgui,videoio,geometry,stereo,calib`, no FFmpeg/CUDA/Python). vcpkg still supplies Eigen, spdlog and nlohmann-json. The presets point `OpenCV_DIR` at `C:/opencv5/x64/vc17/staticlib` — the staticlib config, not the top-level `OpenCVConfig.cmake`, which only finds shared builds. To rebuild it (e.g. after a Visual Studio update), configure the OpenCV source with `-G "Ninja Multi-Config" -DBUILD_SHARED_LIBS=OFF -DBUILD_WITH_STATIC_CRT=OFF -DBUILD_LIST=core,imgproc,imgcodecs,highgui,videoio,geometry,stereo,calib -DCMAKE_INSTALL_PREFIX=C:/opencv5` and `--install` both configurations.
+
+### Release build and the camera benchmark
+
+Frame-rate and detector-timing numbers from a Debug build are meaningless (the consumer thread saturates long before the cameras do). Use the `release` preset:
+
+```powershell
+& $cmake --preset release
+& $cmake --build build-release
+.uild-release\CameraBench.exe --fps 100 --frames 500 --mode all   # raw driver delivery rate, nothing downstream
+.uild-release\GolfSim.exe --stream --frames 200                   # full pipeline; check frame spacing in metadata.json
+```
+
+`CameraBench` opens the drivers directly and reports wall-clock rate, per-read latency and the spacing of the camera's own sample timestamps, single / sequential-pair / parallel. On the rig both OV9281s deliver 100.9 fps in every mode with zero drops (2026-09-20).
+
 ---
 
 ## Linux Environment (Arch / Omarchy)
