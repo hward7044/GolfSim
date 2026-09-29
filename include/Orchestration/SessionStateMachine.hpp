@@ -82,11 +82,19 @@ private:
 
     std::function<void(char)> onSerialCommand_ = nullptr;
     char           lastCommandSent_ = 0;
+    std::chrono::steady_clock::time_point lastCommandSentAt_{};
+    // The strobe controller's watchdog drops MODE_READY after 10 s without a
+    // byte from the PC (firmware/strobe_controller). Only transitions are sent
+    // otherwise, so the current mode is re-asserted well inside that window.
+    std::chrono::milliseconds serialKeepalive_{3000};
 
     void sendSerialCommand(char cmd) {
-        if (onSerialCommand_ && cmd != lastCommandSent_) {
+        if (!onSerialCommand_) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (cmd != lastCommandSent_ || now - lastCommandSentAt_ >= serialKeepalive_) {
             onSerialCommand_(cmd);
             lastCommandSent_ = cmd;
+            lastCommandSentAt_ = now;
         }
     }
 
@@ -162,6 +170,12 @@ public:
 
     void setSerialCallback(std::function<void(char)> cb) {
         onSerialCommand_ = std::move(cb);
+    }
+
+    /// How often an unchanged emitter mode is re-sent (keepalive for the
+    /// controller's watchdog). Must stay well under the firmware's 10 s.
+    void setSerialKeepalive(std::chrono::milliseconds interval) {
+        serialKeepalive_ = interval;
     }
 
     /// Applied camera/detector configuration, recorded into every replay's metadata.json.

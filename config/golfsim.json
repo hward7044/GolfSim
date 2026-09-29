@@ -21,5 +21,8 @@
     "disparityMinPx": 5,
     "disparityMaxPx": 600,
     "swapCameras": false
+  },
+  "strobe": {
+    "pulseWidthUs": 30
   }
 }

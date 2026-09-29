@@ -1,6 +1,7 @@
 #include <Eigen/Core>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -9,6 +10,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/geometry.hpp>
 #include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/videoio.hpp>
 #include <spdlog/spdlog.h>
 #include <thread>
@@ -85,6 +87,30 @@ static nlohmann::json describeCamera(const OV9281CameraNode& node) {
   };
 }
 
+// The pipeline's timing/geometry for this rig, with the exposure and frame
+// rate the hardware actually settled on. Production validates against this;
+// the debug viewer confines its exposure steps to it, so the two agree.
+static PipelineTimingConfig makePipelineTiming(int appliedExposureUs, double frameRateHz,
+                                               const StrobeConfig& strobe) {
+  PipelineTimingConfig timing;
+  timing.workingDistanceMeters = 0.9144; // 3.0 ft
+  timing.nominalBallRadiusPx   = 23.3;   // ~23.3 px radius at 3.0 ft
+  timing.minPointsToSolve      = 3;      // Minimum 3 points
+  timing.maxFramesPerShot      = 2;      // 2 frames maximum for irons/wedges
+  timing.emptyFrameTimeout     = 1;      // Solve immediately on 1st empty frame
+  timing.cameraExposureUs      = appliedExposureUs;
+  timing.cameraFrameRateHz     = frameRateHz;
+  timing.subPulseDurationUs    = strobe.pulseWidthUs;
+  timing.setStrobeRateHz(StrobeConfig::kRateHz);
+  return timing;
+}
+
+// Program the controller's pulse width ("W<us>" + newline). It clamps to the
+// same envelope as StrobeConfig and echoes what it applied.
+static void sendStrobePulseWidth(SerialPort& serial, int pulseWidthUs) {
+  if (serial.isOpen()) serial.writeString("W" + std::to_string(pulseWidthUs) + "\n");
+}
+
 void runCameraDebugViewer(const AppConfig& config, int leftCamIdx, int rightCamIdx,
                           const std::string& comPort, const std::string& leftDev = "",
                           const std::string& rightDev = "");
@@ -106,14 +132,34 @@ int main(int argc, char *argv[]) {
   std::string leftDev;   // Linux: explicit /dev/videoN override for --left-cam
   std::string rightDev;  // Linux: explicit /dev/videoN override for --right-cam
 
+  // Every relative path (config file, session log, replays, shot history) is
+  // anchored on the project root, so the binary behaves the same whether it
+  // is launched from the repo root, from build/, or from an IDE.
+  const std::string projectRoot = AppConfig::findProjectRoot();
+  auto rootedPath = [&projectRoot](const char* rel) {
+    return projectRoot.empty() ? std::string(rel)
+                               : (std::filesystem::path(projectRoot) / rel).make_preferred().string();
+  };
+
   // Configuration: compiled defaults <- config file <- command line
-  std::string configPath = AppConfig::kDefaultPath;
+  std::string configPath = rootedPath(AppConfig::kDefaultPath);
   for (int i = 1; i + 1 < argc; ++i) {
     if (std::string(argv[i]) == "--config") configPath = argv[i + 1];
   }
   AppConfig config = AppConfig::loadFromFile(configPath);
   bool swapCameras = config.stereo.swapCameras;
   bool ignoreTiming = false;
+
+  // Silent fallback to compiled defaults is how a tuned config goes unnoticed;
+  // say so wherever the config summary is logged.
+  auto logConfig = [&config]() {
+    spdlog::info("[Config] {}", config.describe());
+    if (config.sourcePath.empty()) {
+      spdlog::warn("[Config] Running on compiled defaults: no {} found above the working "
+                   "directory or the executable, and no --config given.",
+                   AppConfig::kDefaultPath);
+    }
+  };
 
   // Parse command line arguments
   for (int i = 1; i < argc; ++i) {
@@ -123,8 +169,9 @@ int main(int argc, char *argv[]) {
                 << "        [--config PATH] [--exposure-us N] [--gain N] [--fps N] [--intensity N]\n"
                 << "        [--left-cam N] [--right-cam N] [--left-dev PATH] [--right-dev PATH]\n"
                 << "        [--swap-cameras] [--com PORT] [--ignore-timing] [--version]\n"
-                << "Config file (default " << AppConfig::kDefaultPath << ") holds camera, detector and stereo settings;\n"
-                << "command-line values override it." << std::endl;
+                << "Config file (default " << AppConfig::kDefaultPath << ", resolved against the nearest\n"
+                << "project root above the working directory or the executable) holds camera,\n"
+                << "detector and stereo settings; command-line values override it." << std::endl;
       return 0;
     }
     if (arg == "--version" || arg == "-v") {
@@ -195,7 +242,7 @@ int main(int argc, char *argv[]) {
   }
 
   if (liveMode || RUN_DEBUG_VIEWER) {
-    spdlog::info("[Config] {}", config.describe());
+    logConfig();
     runCameraDebugViewer(config, leftCamIdx, rightCamIdx, comPort, leftDev, rightDev);
     return 0;
   }
@@ -211,7 +258,7 @@ int main(int argc, char *argv[]) {
   try {
     auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
     auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
-        "build/session.log", true);
+        rootedPath("build/session.log"), true);
     spdlog::set_default_logger(std::make_shared<spdlog::logger>(
         "multi_sink", spdlog::sinks_init_list({console_sink, file_sink})));
     spdlog::set_level(spdlog::level::info);
@@ -222,7 +269,7 @@ int main(int argc, char *argv[]) {
 
   auto cameraSystem = std::make_shared<HardwareSyncedCameraSystem>();
 
-  spdlog::info("[Config] {}", config.describe());
+  logConfig();
   spdlog::info("[System] Initializing camera drivers...");
   PlatformCameraDriver::logConnectedDevices();
 
@@ -295,15 +342,10 @@ int main(int argc, char *argv[]) {
   // - Stereo Triangulator (Uses default horizontal calibration)
   // - Kinematics physics engine
   // - Local network TCP transmitter (Target loopback, port 9002)
-  PipelineTimingConfig timingConfig;
-  timingConfig.workingDistanceMeters = 0.9144; // 3.0 ft
-  timingConfig.nominalBallRadiusPx   = 23.3;   // ~23.3 px radius at 3.0 ft
-  timingConfig.minPointsToSolve      = 3;      // Minimum 3 points
-  timingConfig.maxFramesPerShot      = 2;      // 2 frames maximum for irons/wedges
-  timingConfig.emptyFrameTimeout     = 1;      // Solve immediately on 1st empty frame
-  timingConfig.cameraExposureUs      = appliedExposureUs;
-  timingConfig.cameraFrameRateHz     = negotiatedFps > 0.0 ? negotiatedFps
-                                                            : static_cast<double>(config.camera.targetFps);
+  PipelineTimingConfig timingConfig = makePipelineTiming(
+      appliedExposureUs,
+      negotiatedFps > 0.0 ? negotiatedFps : static_cast<double>(config.camera.targetFps),
+      config.strobe);
 
   // The strobe train must fit inside the exposure, and the exposure inside one
   // frame period — otherwise pulses are silently lost. Refuse rather than guess.
@@ -330,7 +372,9 @@ int main(int argc, char *argv[]) {
   auto network = TcpJsonTransmitter("127.0.0.1", 9002);
 
   auto stateMachine = std::make_shared<ConcreteSSM>(trigger, vision, spatial,
-                                                    kinematics, network, timingConfig);
+                                                    kinematics, network, timingConfig,
+                                                    rootedPath("build/replays"),
+                                                    rootedPath("build/shot_history.json"));
   sessionInfo["timing"] = {
       {"cameraExposureUs", timingConfig.cameraExposureUs},
       {"cameraFrameRateHz", timingConfig.cameraFrameRateHz},
@@ -342,7 +386,9 @@ int main(int argc, char *argv[]) {
   // Initialize Serial connection to Arduino Strobe Controller (with 2 retries before graceful degradation)
   SerialPort serial;
   if (serial.openWithRetry(comPort, 115200, 2, 500)) {
-    spdlog::info("[System] Connected to IR Strobe Controller on {}", comPort);
+    spdlog::info("[System] Connected to IR Strobe Controller on {}; pulse width {} us ({:.1f}% duty at {} Hz)",
+                 comPort, config.strobe.pulseWidthUs, config.strobe.dutyCycle() * 100.0, StrobeConfig::kRateHz);
+    sendStrobePulseWidth(serial, config.strobe.pulseWidthUs);
   } else {
     spdlog::warn("[System] Could not connect to IR Strobe Controller on {}. Running in offline/simulation mode.", comPort);
   }
@@ -474,21 +520,150 @@ void runCameraDebugViewer(const AppConfig& config, int leftCamIdx, int rightCamI
     if (f <= 0.0 && nodeR) f = nodeR->getNegotiatedFps();
     return f;
   };
+  auto applyExposure = [&](int us) {
+    if (nodeL) nodeL->setExposure(us);
+    if (nodeR) nodeR->setExposure(us);
+  };
+
+  // Only exposures the pipeline will accept can be selected here: the strobe
+  // train must fit inside the exposure, and the exposure inside one frame at
+  // the rate the cameras actually negotiated. Otherwise a value tuned in this
+  // viewer is refused at production startup.
+  const double frameRateHz = negotiatedFps() > 0.0 ? negotiatedFps()
+                                                   : static_cast<double>(config.camera.targetFps);
+  StrobeConfig strobe = config.strobe;   // 'w'/'W' step the pulse width inside its envelope
+  // Bench mode ('b'): stationary brightness tests past the 100 us blur cap, up
+  // to the firmware's optical budget. A pulse of width w at today's current
+  // has the same energy (and shot noise) as a w/5 pulse at 5x current, so it
+  // previews the overdrive plan without touching the board.
+  bool   benchMode    = false;
+  double mcuOverdrive = 1.0;             // LED_OVERDRIVE_RATIO the controller reports on 'P'
+  auto pulseWidthLimitUs = [&]() {
+    return benchMode ? StrobeConfig::benchPulseWidthLimitUs(mcuOverdrive) : StrobeConfig::kMaxPulseWidthUs;
+  };
+  PipelineTimingConfig timing = makePipelineTiming(appliedExposureUs(), frameRateHz, strobe);
+  PipelineTimingConfig::ExposureLog2Range safeExposure = timing.validExposureLog2Range();
+  auto safeRangeStr = [&]() {
+    if (safeExposure.empty()) return std::string("none");
+    return std::to_string(CameraConfig::exposureLog2ToUs(safeExposure.lo)) + ".." +
+           std::to_string(CameraConfig::exposureLog2ToUs(safeExposure.hi)) + " us";
+  };
+  if (safeExposure.empty()) {
+    std::cerr << "Warning: no UVC exposure step holds the " << static_cast<int>(timing.strobeTrainDurationUs())
+              << " us strobe train inside the " << static_cast<int>(timing.framePeriodUs()) << " us frame period at "
+              << frameRateHz << " fps. Exposure keys are limited to the hardware range only." << std::endl;
+  } else if (!timing.isValidExposureUs(appliedExposureUs())) {
+    int snapped = safeExposure.clamp(exposureLog2);
+    std::cout << "Warning: configured exposure " << appliedExposureUs() << " us is outside the strobe-safe range ("
+              << safeRangeStr() << "); snapping to " << CameraConfig::exposureLog2ToUs(snapped) << " us." << std::endl;
+    exposureLog2 = snapped;
+    applyExposure(CameraConfig::exposureLog2ToUs(exposureLog2));
+  }
+  // Brightest pixel seen in the last two seconds, so a 10 Hz standby pulse or
+  // an 'F' burst registers even when the display loop skips that frame.
+  double peakL = 0.0, peakR = 0.0;
+  auto peakAt = std::chrono::steady_clock::now();
+  // 'c' saves the current frame pair + settings here for offline inspection.
+  const std::string projectRoot = AppConfig::findProjectRoot();
+  const std::filesystem::path captureDir =
+      (projectRoot.empty() ? std::filesystem::path("build") : std::filesystem::path(projectRoot) / "build") / "captures";
   std::string strobeStatusStr = "STROBE: 300 Hz READY";
 
+  // Controller link. Every reply is echoed so a mode change that did not land
+  // is visible, and a 'P' ping once a second both holds the firmware's 10 s
+  // watchdog off (it drops 300 Hz mode without PC traffic) and reads back the
+  // pulse counter, so the HUD shows the rate the LEDs are really being driven
+  // at: 300/s in READY, 10/s in STANDBY, 0 in OFF and DC.
+  std::string mcuStatusStr = serial.isOpen() ? "MCU: waiting for ping reply" : "MCU: not connected";
+  std::string serialLineBuf;
+  unsigned long lastPulses = 0;
+  auto lastPingAt = std::chrono::steady_clock::now();
+  auto lastPulsesAt = lastPingAt;
+  bool havePulses = false;
+  bool pulseRateMissing = false;   // a pulsed mode reporting 0/s: firmware or wiring fault
+  auto pollController = [&]() {
+    if (!serial.isOpen()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastPingAt >= std::chrono::seconds(1)) {
+      serial.writeChar('P');
+      lastPingAt = now;
+    }
+    serialLineBuf += serial.readAvailable();
+    size_t eol;
+    while ((eol = serialLineBuf.find('\n')) != std::string::npos) {
+      std::string line = serialLineBuf.substr(0, eol);
+      serialLineBuf.erase(0, eol + 1);
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (line.empty()) continue;
+      if (line.rfind("OK mode=", 0) == 0) {
+        // "OK mode=READY pulses=N width=30 od=1.0" (width/od absent on older builds)
+        auto field = [&line](const char* key) -> const char* {
+          size_t at = line.find(key);
+          return at == std::string::npos ? nullptr : line.c_str() + at + std::strlen(key);
+        };
+        const size_t modeAt = 8, modeEnd = line.find(' ', modeAt);
+        std::string mode = line.substr(modeAt, modeEnd == std::string::npos ? std::string::npos : modeEnd - modeAt);
+        const char* pf = field(" pulses=");
+        unsigned long pulses = pf ? std::strtoul(pf, nullptr, 10) : 0;
+        const char* w = field(" width=");
+        int mcuWidthUs = w ? std::atoi(w) : -1;
+        const char* od = field(" od=");
+        double overdrive = od ? std::atof(od) : 1.0;
+        mcuOverdrive = overdrive;
+        char buf[128];
+        int n;
+        if (havePulses) {
+          std::chrono::duration<double> dt = now - lastPulsesAt;
+          double pulsesPerSec = dt.count() > 0.0 ? static_cast<double>(pulses - lastPulses) / dt.count() : 0.0;
+          n = snprintf(buf, sizeof(buf), "MCU: %s | LED pulses %lu (%.0f/s)", mode.c_str(), pulses, pulsesPerSec);
+          pulseRateMissing = (mode == "READY" || mode == "STANDBY") && pulsesPerSec < 1.0;
+        } else {
+          n = snprintf(buf, sizeof(buf), "MCU: %s | LED pulses %lu (measuring)", mode.c_str(), pulses);
+        }
+        // The controller may have clamped the width further than the PC did
+        // (LED_OVERDRIVE_RATIO in the firmware); show what it actually runs.
+        if (mcuWidthUs >= 0 && n > 0 && n < static_cast<int>(sizeof(buf))) {
+          snprintf(buf + n, sizeof(buf) - n, " | %dus x%.1f%s", mcuWidthUs, overdrive,
+                   mcuWidthUs != strobe.pulseWidthUs ? " (clamped by MCU)" : "");
+        }
+        lastPulses = pulses;
+        lastPulsesAt = now;
+        havePulses = true;
+        mcuStatusStr = buf;
+      } else if (line == "OK") {
+        mcuStatusStr = "MCU: old firmware (camera-sync build, never pulses): reflash firmware/strobe_controller";
+        pulseRateMissing = true;
+      } else {
+        std::cout << "[Arduino] " << line << std::endl;
+      }
+    }
+  };
+
   if (serial.isOpen()) {
+      sendStrobePulseWidth(serial, strobe.pulseWidthUs);
       serial.writeChar('H');
   }
 
   std::cout << "\n=======================================================" << std::endl;
   std::cout << "GOLFSIM 300 HZ IR STROBE DEBUGGER CONTROLS:" << std::endl;
+  std::cout << "  (Tune exposure/threshold with the 300 Hz strobe active ('H'): that is what the pipeline runs.)" << std::endl;
   std::cout << "  - Press 'h' / 'H' : 300 Hz Strobe Active Mode ('H')" << std::endl;
   std::cout << "  - Press 'l' / 'L' : 10 Hz Standby Protection Mode ('L')" << std::endl;
   std::cout << "  - Press '1'       : Turn IR Illumination CONTINUOUSLY ON (Aiming)" << std::endl;
   std::cout << "  - Press '0'       : Turn IR Illumination OFF ('0')" << std::endl;
   std::cout << "  - Press 's' / 'f' : Fire Single 3-Pulse 300 Hz Test Burst ('F')" << std::endl;
-  std::cout << "  - Press 'e' / 'E' : Exposure one UVC step down / up (122us ... 31ms, x2 per step)" << std::endl;
+  std::cout << "  HUD 'MCU' line: controller mode and LED pulse rate it reports (300/s in 'H', 10/s in 'L')." << std::endl;
+  std::cout << "  HUD 'Max' is the brightest pixel: compare it under '1' (DC) and 'H' to size the strobe light budget." << std::endl;
+  std::cout << "  - Press 'e' / 'E' : Exposure one UVC step down / up, kept strobe-safe (" << safeRangeStr()
+            << " at " << frameRateHz << " fps)" << std::endl;
   std::cout << "  - Press 'g' / 'G' : Gain -5 / +5 (0..100)" << std::endl;
+  std::cout << "  - Press 'w' / 'W' : Strobe pulse width -10 / +10 us (" << StrobeConfig::kMinPulseWidthUs << ".."
+            << StrobeConfig::kMaxPulseWidthUs << " us; duty <= " << StrobeConfig::kMaxDutyCycle * 100.0
+            << "% at " << StrobeConfig::kRateHz << " Hz). Wider = brighter per pulse, more blur in flight." << std::endl;
+  std::cout << "  - Press 'b'       : BENCH mode: unlock pulse width up to the optical budget ("
+            << StrobeConfig::benchPulseWidthLimitUs(1.0) << " us at 1x) for a STATIONARY ball." << std::endl;
+  std::cout << "                      A w us pulse now = a w/5 us pulse at 5x current: 500 us previews 5x@100us." << std::endl;
+  std::cout << "  - Press 'c'       : Save the current left/right frames + settings to " << captureDir.string() << std::endl;
   std::cout << "  - Press 'v'       : Cycle View Modes (Both -> Left -> Right -> Dot Clusters -> Threshold Mask)" << std::endl;
   std::cout << "  - Press '+' / '-' : Adjust Intensity Threshold (Current: " << activeThreshold << ")" << std::endl;
   std::cout << "  - Press 'p'       : Print the current camera/detector values as config JSON" << std::endl;
@@ -503,6 +678,7 @@ void runCameraDebugViewer(const AppConfig& config, int leftCamIdx, int rightCamI
   double fps = 0.0;
 
   while (true) {
+    pollController();
     if (!cameraSystem.captureSynchronizedFrames(frameSet)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       continue;
@@ -523,11 +699,17 @@ void runCameraDebugViewer(const AppConfig& config, int leftCamIdx, int rightCamI
 
     cv::Scalar meanLeft = leftFrame.empty() ? cv::Scalar(0) : cv::mean(leftFrame);
     cv::Scalar meanRight = rightFrame.empty() ? cv::Scalar(0) : cv::mean(rightFrame);
+    double maxLeft = 0.0, maxRight = 0.0;
+    if (!leftFrame.empty())  cv::minMaxLoc(leftFrame,  nullptr, &maxLeft);
+    if (!rightFrame.empty()) cv::minMaxLoc(rightFrame, nullptr, &maxRight);
+    if (current_time - peakAt > std::chrono::seconds(2)) { peakL = 0.0; peakR = 0.0; peakAt = current_time; }
+    if (maxLeft  > peakL) { peakL = maxLeft;  peakAt = current_time; }
+    if (maxRight > peakR) { peakR = maxRight; peakAt = current_time; }
 
     cv::Mat displayLeft, displayRight;
     char expBuf[96];
-    snprintf(expBuf, sizeof(expBuf), "Exp: %dus | Gain: %d | Cam: %.0f fps", appliedExposureUs(),
-             gain, negotiatedFps());
+    snprintf(expBuf, sizeof(expBuf), "Exp: %dus (safe %s) | Gain: %d | Pulse: %dus | Cam: %.0f fps",
+             appliedExposureUs(), safeRangeStr().c_str(), gain, strobe.pulseWidthUs, negotiatedFps());
     std::string expStr = expBuf;
 
     // Draw what the production detector sees: dots (blue), accepted clusters
@@ -568,11 +750,22 @@ void runCameraDebugViewer(const AppConfig& config, int leftCamIdx, int rightCamI
                   cv::FONT_HERSHEY_SIMPLEX, 0.65, (strobeStatusStr.find("OFF") == std::string::npos) ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255), 2);
       cv::putText(displayLeft, expStr + " | Thresh: " + std::to_string(activeThreshold), cv::Point(20, 65),
                   cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(255, 255, 0), 2);
+      cv::putText(displayLeft, mcuStatusStr, cv::Point(20, 95), cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                  pulseRateMissing ? cv::Scalar(0, 0, 255) : cv::Scalar(255, 255, 0), 2);
+      if (benchMode) {
+        char benchBuf[160];
+        snprintf(benchBuf, sizeof(benchBuf),
+                 "BENCH %dus = %.1fx@100us / %.0fx@30us | blur %.0f mm @100mph | STATIONARY TEST ONLY",
+                 strobe.pulseWidthUs, strobe.pulseWidthUs / 100.0, strobe.pulseWidthUs / 30.0,
+                 StrobeConfig::blurMmAt100mph(strobe.pulseWidthUs));
+        cv::putText(displayLeft, benchBuf, cv::Point(20, 155), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                    cv::Scalar(0, 165, 255), 2);
+      }
       if (currentMode == VIEW_GLINT_HIGHLIGHT) {
         char dotBuf[96];
         snprintf(dotBuf, sizeof(dotBuf), "Clusters: %zu | Dots rejected: %zu", dotsL.clusters.size(),
                  dotsL.rejectedDots.size());
-        cv::putText(displayLeft, dotBuf, cv::Point(20, 95), cv::FONT_HERSHEY_SIMPLEX, 0.6,
+        cv::putText(displayLeft, dotBuf, cv::Point(20, 125), cv::FONT_HERSHEY_SIMPLEX, 0.6,
                     cv::Scalar(0, 255, 0), 2);
       }
     }
@@ -589,8 +782,10 @@ void runCameraDebugViewer(const AppConfig& config, int leftCamIdx, int rightCamI
       }
       cv::putText(displayRight, "RIGHT | Measured FPS: " + std::to_string(fps).substr(0, 4), cv::Point(20, 35),
                   cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 255, 0), 2);
-      cv::putText(displayRight, "Mean: " + std::to_string(meanRight[0]).substr(0, 4) +
-                  "  Mean L: " + std::to_string(meanLeft[0]).substr(0, 4), cv::Point(20, 65),
+      char lightBuf[128];
+      snprintf(lightBuf, sizeof(lightBuf), "Mean R %.1f L %.1f | Max R %.0f L %.0f (2s peak R %.0f L %.0f)",
+               meanRight[0], meanLeft[0], maxRight, maxLeft, peakR, peakL);
+      cv::putText(displayRight, lightBuf, cv::Point(20, 65),
                   cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(255, 255, 0), 2);
       if (currentMode == VIEW_GLINT_HIGHLIGHT) {
         char dotBuf[128];
@@ -665,26 +860,97 @@ void runCameraDebugViewer(const AppConfig& config, int leftCamIdx, int rightCamI
           std::cout << "[IR Strobe Debugger] Serial not connected." << std::endl;
       }
     } else if (key == 'e' || key == 'E') {
-      exposureLog2 += (key == 'E') ? 1 : -1;
-      exposureLog2 = std::clamp(exposureLog2, CameraConfig::kMinExposureLog2, CameraConfig::kMaxExposureLog2);
-      int us = CameraConfig::exposureLog2ToUs(exposureLog2);
-      std::cout << "[IR Strobe Debugger] Setting exposure to " << us << " us (log2 " << exposureLog2 << ")..." << std::endl;
-      if (nodeL) nodeL->setExposure(us);
-      if (nodeR) nodeR->setExposure(us);
+      const int lo = safeExposure.empty() ? CameraConfig::kMinExposureLog2 : safeExposure.lo;
+      const int hi = safeExposure.empty() ? CameraConfig::kMaxExposureLog2 : safeExposure.hi;
+      int next = std::clamp(exposureLog2 + ((key == 'E') ? 1 : -1), lo, hi);
+      if (next == exposureLog2) {
+        std::cout << "[IR Strobe Debugger] Exposure stays at " << CameraConfig::exposureLog2ToUs(exposureLog2)
+                  << " us: the strobe-safe range at " << frameRateHz << " fps is " << safeRangeStr() << "." << std::endl;
+      } else {
+        exposureLog2 = next;
+        int us = CameraConfig::exposureLog2ToUs(exposureLog2);
+        std::cout << "[IR Strobe Debugger] Setting exposure to " << us << " us (log2 " << exposureLog2 << ")..." << std::endl;
+        applyExposure(us);
+      }
     } else if (key == 'g' || key == 'G') {
       gain = std::clamp(gain + ((key == 'G') ? 5 : -5), 0, CameraConfig::kMaxGain);
       std::cout << "[IR Strobe Debugger] Setting gain to " << gain << "..." << std::endl;
       if (nodeL) nodeL->setGain(gain);
       if (nodeR) nodeR->setGain(gain);
+    } else if (key == 'w' || key == 'W') {
+      // 10 us steps up to the shot cap, 50 us steps beyond it in bench mode.
+      const int step = (key == 'W' ? strobe.pulseWidthUs >= StrobeConfig::kMaxPulseWidthUs
+                                   : strobe.pulseWidthUs > StrobeConfig::kMaxPulseWidthUs) ? 50 : 10;
+      StrobeConfig next = strobe;
+      next.pulseWidthUs = std::clamp(strobe.pulseWidthUs + (key == 'W' ? step : -step),
+                                     StrobeConfig::kMinPulseWidthUs, pulseWidthLimitUs());
+      if (next.pulseWidthUs == strobe.pulseWidthUs) {
+        std::cout << "[IR Strobe Debugger] Pulse width stays at " << strobe.pulseWidthUs << " us: limit is "
+                  << StrobeConfig::kMinPulseWidthUs << ".." << pulseWidthLimitUs() << " us"
+                  << (benchMode ? " (bench: optical budget at the controller's overdrive ratio)."
+                                : " (shot cap; press 'b' for a stationary bench test past it).") << std::endl;
+      } else {
+        strobe = next;
+        std::cout << "[IR Strobe Debugger] Pulse width " << strobe.pulseWidthUs << " us ("
+                  << std::fixed << std::setprecision(1) << strobe.dutyCycle() * 100.0 << "% duty)" << std::endl;
+        sendStrobePulseWidth(serial, strobe.pulseWidthUs);
+        // A wider pulse lengthens the train the exposure has to hold.
+        timing = makePipelineTiming(appliedExposureUs(), frameRateHz, strobe);
+        safeExposure = timing.validExposureLog2Range();
+      }
+    } else if (key == 'b' || key == 'B') {
+      benchMode = !benchMode;
+      if (benchMode) {
+        std::cout << "[IR Strobe Debugger] BENCH mode ON: pulse width unlocked to " << pulseWidthLimitUs()
+                  << " us for a stationary ball. Flight frames would smear; this is for judging brightness only."
+                  << std::endl;
+      } else {
+        StrobeConfig back = strobe;
+        back.clampToEnvelope();
+        std::cout << "[IR Strobe Debugger] BENCH mode OFF";
+        if (back.pulseWidthUs != strobe.pulseWidthUs) {
+          strobe = back;
+          sendStrobePulseWidth(serial, strobe.pulseWidthUs);
+          timing = makePipelineTiming(appliedExposureUs(), frameRateHz, strobe);
+          safeExposure = timing.validExposureLog2Range();
+          std::cout << ": pulse width back to " << strobe.pulseWidthUs << " us";
+        }
+        std::cout << "." << std::endl;
+      }
+    } else if (key == 'c' || key == 'C') {
+      std::error_code ec;
+      std::filesystem::create_directories(captureDir, ec);
+      const auto stampMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch()).count();
+      const std::string stem = (captureDir / ("capture_" + std::to_string(stampMs))).string();
+      bool ok = true;
+      if (!leftFrame.empty())  ok = cv::imwrite(stem + "_L.png", leftFrame)  && ok;
+      if (!rightFrame.empty()) ok = cv::imwrite(stem + "_R.png", rightFrame) && ok;
+      nlohmann::json meta = {
+          {"strobeMode", strobeStatusStr}, {"mcu", mcuStatusStr}, {"bench", benchMode},
+          {"pulseWidthUs", strobe.pulseWidthUs}, {"exposureUs", appliedExposureUs()}, {"gain", gain},
+          {"threshold", activeThreshold}, {"fps", negotiatedFps()},
+          {"maxL", maxLeft}, {"maxR", maxRight}, {"meanL", meanLeft[0]}, {"meanR", meanRight[0]},
+      };
+      std::ofstream(stem + ".json") << meta.dump(2) << "\n";
+      std::cout << "[IR Strobe Debugger] " << (ok ? "Saved " : "FAILED saving ") << stem << "_{L,R}.png (+ .json): max L "
+                << maxLeft << " R " << maxRight << std::endl;
     } else if (key == 'p' || key == 'P') {
       CameraConfig cam = config.camera;
       cam.exposureUs = appliedExposureUs();
       cam.gain = gain;
       DotClusterConfig det = dotConfig;
       det.intensityThreshold = activeThreshold;
-      nlohmann::json snapshot = {{"camera", cam.toJson()}, {"detector", det.toJson()}};
+      StrobeConfig shot = strobe;
+      const bool clampedForShots = shot.clampToEnvelope();   // bench widths never go into the config
+      nlohmann::json snapshot = {{"camera", cam.toJson()}, {"detector", det.toJson()}, {"strobe", shot.toJson()}};
       std::cout << "[IR Strobe Debugger] Current settings (paste into config/golfsim.json):\n"
                 << snapshot.dump(2) << std::endl;
+      if (clampedForShots) {
+        std::cout << "[IR Strobe Debugger] Note: bench pulse width " << strobe.pulseWidthUs << " us written as "
+                  << shot.pulseWidthUs << " us; a shot needs " << strobe.pulseWidthUs / shot.pulseWidthUs
+                  << "x the pulse current to match this brightness." << std::endl;
+      }
     } else if (key == 9 || key == 'v' || key == 'V') {
       currentMode = (currentMode + 1) % 5;
     } else if (key == 's' || key == 'S' || key == 'f' || key == 'F') {

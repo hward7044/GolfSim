@@ -21,17 +21,6 @@ void ThreadManager::startProducerThread() {
     producerThread_ = std::jthread([this](std::stop_token stopToken) {
         spdlog::info("[ThreadManager] Starting Producer Thread...");
 
-#ifdef _WIN32
-        // Open the serial port for the MCU trigger board once at session startup.
-        // COM3 is used as a default placeholder; this can be loaded from configuration.
-        std::string comPort = "COM3"; 
-        int baudRate = 115200;
-        if (!serial_.open(comPort, baudRate)) {
-            spdlog::error("[ThreadManager] Trigger MCU serial port configuration failed. "
-                          "Launch monitors will not be triggered automatically.");
-        }
-#endif
-
         FrameSet frameSet;
         // Pre-allocate frame buffers (OV9281 resolution: 1280x800)
         frameSet.preallocate(1280, 800);
@@ -55,9 +44,6 @@ void ThreadManager::startProducerThread() {
             }
         }
 
-#ifdef _WIN32
-        serial_.close();
-#endif
         spdlog::info("[ThreadManager] Producer Thread terminated cleanly.");
     });
 }

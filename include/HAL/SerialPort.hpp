@@ -33,6 +33,10 @@ public:
     void flush();
     bool isOpen() const noexcept;
 
+    /// Everything the device has sent that has not been read yet, without
+    /// waiting for more. Empty when nothing is pending or the port is closed.
+    std::string readAvailable();
+
     const std::string& getPortName() const noexcept { return portName_; }
     int getBaudRate() const noexcept { return baudRate_; }
 };

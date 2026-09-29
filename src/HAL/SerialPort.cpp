@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <termios.h>
+#include <sys/ioctl.h>
 #include <errno.h>
 #include <cstring>
 #endif
@@ -109,6 +110,24 @@ void SerialPort::flush() {
     }
 }
 
+std::string SerialPort::readAvailable() {
+    if (!isOpen()) return {};
+    // Ask how much is queued first so ReadFile returns at once instead of
+    // sitting out the read timeouts waiting for bytes that may never come.
+    DWORD errors = 0;
+    COMSTAT status = {};
+    if (!ClearCommError(static_cast<HANDLE>(hSerial_), &errors, &status) || status.cbInQue == 0) {
+        return {};
+    }
+    std::string out(status.cbInQue, '\0');
+    DWORD bytesRead = 0;
+    if (!ReadFile(static_cast<HANDLE>(hSerial_), out.data(), status.cbInQue, &bytesRead, nullptr)) {
+        return {};
+    }
+    out.resize(bytesRead);
+    return out;
+}
+
 bool SerialPort::isOpen() const noexcept {
     return hSerial_ != (void*)-1;
 }
@@ -197,6 +216,17 @@ void SerialPort::flush() {
     if (isOpen()) {
         tcdrain(fd_);
     }
+}
+
+std::string SerialPort::readAvailable() {
+    if (!isOpen()) return {};
+    int queued = 0;
+    if (ioctl(fd_, FIONREAD, &queued) != 0 || queued <= 0) return {};
+    std::string out(static_cast<size_t>(queued), '\0');
+    ssize_t bytesRead = ::read(fd_, out.data(), out.size());
+    if (bytesRead <= 0) return {};
+    out.resize(static_cast<size_t>(bytesRead));
+    return out;
 }
 
 bool SerialPort::isOpen() const noexcept {

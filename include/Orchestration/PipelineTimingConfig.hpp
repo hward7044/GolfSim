@@ -1,4 +1,6 @@
 #pragma once
+#include "Camera/CameraConfig.hpp"
+#include <algorithm>
 
 /**
  * @brief Centralized timing, optical geometry, and stroboscopic configuration
@@ -52,7 +54,10 @@ struct PipelineTimingConfig {
     /// Camera frame rate the exposure window must fit inside (Hz).
     double cameraFrameRateHz     = 100.0;
 
-    /// Expected number of stroboscopic pulses captured within each camera exposure window.
+    /// Pulse train the exposure must hold: (strobePulseCount - 1) intervals plus
+    /// one pulse. The strobe free-runs against the camera, so an exposure of that
+    /// length captures strobePulseCount - 1 complete pulses in every frame and
+    /// strobePulseCount in some (a third of frames at 7812 us / 300 Hz).
     int    strobePulseCount      = 3;
 
     /// Inactivity duration (seconds) with no ball on the tee before dropping to standby rate.
@@ -77,18 +82,44 @@ struct PipelineTimingConfig {
         return cameraFrameRateHz > 0.0 ? 1e6 / cameraFrameRateHz : 0.0;
     }
 
-    /// Validates that the exposure window holds every sub-pulse and still fits
-    /// inside one frame period at the configured frame rate.
-    bool isValidTiming() const noexcept {
-        if (cameraExposureUs <= 0 || pulseIntervalMs <= 0.0 || strobePulseCount <= 0) {
+    /// Whether an exposure of `exposureUs` would hold every sub-pulse and still
+    /// fit inside one frame period at the configured frame rate. This is the
+    /// one rule for what the camera may be set to; the debug viewer uses it to
+    /// keep its exposure steps inside what the pipeline will accept.
+    bool isValidExposureUs(int exposureUs) const noexcept {
+        if (exposureUs <= 0 || pulseIntervalMs <= 0.0 || strobePulseCount <= 0) {
             return false;
         }
-        if (cameraExposureUs < static_cast<int>(strobeTrainDurationUs())) {
+        if (exposureUs < static_cast<int>(strobeTrainDurationUs())) {
             return false;
         }
-        if (cameraFrameRateHz > 0.0 && cameraExposureUs >= static_cast<int>(framePeriodUs())) {
+        if (cameraFrameRateHz > 0.0 && exposureUs >= static_cast<int>(framePeriodUs())) {
             return false;
         }
         return true;
+    }
+
+    /// Validates the configured exposure against isValidExposureUs().
+    bool isValidTiming() const noexcept {
+        return isValidExposureUs(cameraExposureUs);
+    }
+
+    /// The UVC exposure steps (log2 seconds) that isValidExposureUs() accepts,
+    /// as an inclusive [lo, hi]; empty() when no step fits at this frame rate.
+    /// Contiguous by construction: a lower bound from the strobe train and an
+    /// upper bound from the frame period.
+    struct ExposureLog2Range {
+        int lo, hi;
+        bool empty() const noexcept { return lo > hi; }
+        int clamp(int log2Value) const noexcept { return std::clamp(log2Value, lo, hi); }
+    };
+    ExposureLog2Range validExposureLog2Range() const noexcept {
+        ExposureLog2Range r{CameraConfig::kMaxExposureLog2 + 1, CameraConfig::kMinExposureLog2 - 1};
+        for (int step = CameraConfig::kMinExposureLog2; step <= CameraConfig::kMaxExposureLog2; ++step) {
+            if (!isValidExposureUs(CameraConfig::exposureLog2ToUs(step))) continue;
+            r.lo = std::min(r.lo, step);
+            r.hi = std::max(r.hi, step);
+        }
+        return r;
     }
 };

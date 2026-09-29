@@ -10,10 +10,6 @@
 #include "Orchestration/SessionStateMachine.hpp"
 #include <memory>
 
-#ifdef _WIN32
-#include "HAL/Win32Serial.hpp"
-#endif
-
 // Concrete instantiation of SessionStateMachine for the production hot-path.
 // Static dispatch — zero virtual call overhead.
 using ConcreteSSM = SessionStateMachine<
@@ -32,10 +28,6 @@ private:
     std::shared_ptr<ICameraSystem>          cameraSystem;
     std::shared_ptr<IBufferManager<FrameSet>> buffer;
     std::shared_ptr<ConcreteSSM>            stateMachine;
-
-#ifdef _WIN32
-    Win32Serial                             serial_;
-#endif
 
     std::atomic<bool>                       running_{false};
     std::jthread                            producerThread_;

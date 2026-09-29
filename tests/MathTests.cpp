@@ -827,6 +827,37 @@ GOLFSIM_TEST(SessionStateMachineStroboscopicTiming) {
         TEST_ASSERT(t.isValidTiming());
     }
 
+    // The UVC steps the debug viewer may select are exactly those the pipeline
+    // accepts: at 100 fps only 7812 us (log2 -7) holds the train and fits the frame.
+    {
+        PipelineTimingConfig t = config;
+        auto r = t.validExposureLog2Range();
+        TEST_ASSERT(!r.empty() && r.lo == -7 && r.hi == -7);
+        TEST_ASSERT(CameraConfig::exposureLog2ToUs(r.lo) == 7812);
+        TEST_ASSERT(r.clamp(-9) == -7 && r.clamp(-7) == -7 && r.clamp(-5) == -7);   // 1953 / 7812 / 31250 us
+        TEST_ASSERT(t.isValidExposureUs(7812) && !t.isValidExposureUs(1953) && !t.isValidExposureUs(15625));
+
+        t.cameraFrameRateHz = 60.0;         // 16.7 ms frame: 7812 and 15625 us fit
+        r = t.validExposureLog2Range();
+        TEST_ASSERT(r.lo == -7 && r.hi == -6);
+
+        t.cameraFrameRateHz = 30.0;         // 33.3 ms frame: up to 31250 us
+        r = t.validExposureLog2Range();
+        TEST_ASSERT(r.lo == -7 && r.hi == -5);
+
+        t.cameraFrameRateHz = 200.0;        // 5 ms frame cannot hold the 6.7 ms train
+        r = t.validExposureLog2Range();
+        TEST_ASSERT(r.empty());
+
+        // The widest pulse the envelope allows still leaves 7812 us as the only
+        // valid step at 100 fps: the train grows to 6.77 ms, under the exposure.
+        t = config;
+        t.subPulseDurationUs = StrobeConfig::kMaxPulseWidthUs;
+        TEST_NEAR(t.strobeTrainDurationUs(), 6766.6, 1.0);
+        r = t.validExposureLog2Range();
+        TEST_ASSERT(r.lo == -7 && r.hi == -7);
+    }
+
     // Helper to generate a dummy FrameSet
     auto makeFrameSet = []() {
         FrameSet fs;
@@ -834,6 +865,32 @@ GOLFSIM_TEST(SessionStateMachineStroboscopicTiming) {
         fs.timestamp = 1000;
         return fs;
     };
+
+    // Emitter commands: only transitions are sent, except that the current mode
+    // is re-asserted after the keepalive interval so the strobe controller's
+    // 10 s watchdog never drops it out of 300 Hz mode.
+    {
+        struct KeepaliveTrigger {
+            bool checkTrigger(const cv::Mat&, const cv::Mat&) { return false; }
+            bool isStandbyRequested() const noexcept { return false; }   // always asks for 'H'
+            void reset() {}
+        };
+        SessionStateMachine<KeepaliveTrigger, MockStrobeVision, MockStrobeSpatial, MockStrobeKinematics, MockStrobeNet>
+            ssm(KeepaliveTrigger(), MockStrobeVision(), MockStrobeSpatial(), MockStrobeKinematics(), MockStrobeNet(),
+                PipelineTimingConfig(), ssmReplayDir, ssmHistoryPath);
+        std::vector<char> sent;
+        ssm.setSerialCallback([&sent](char c) { sent.push_back(c); });
+        ssm.setSerialKeepalive(std::chrono::milliseconds(40));
+
+        for (int i = 0; i < 5; ++i) ssm.processNextFrame(makeFrameSet());
+        TEST_ASSERT(sent.size() == 1 && sent[0] == 'H');            // deduplicated within the interval
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        ssm.processNextFrame(makeFrameSet());
+        TEST_ASSERT(sent.size() == 2 && sent[1] == 'H');            // re-asserted after the interval
+        ssm.processNextFrame(makeFrameSet());
+        TEST_ASSERT(sent.size() == 2);                              // and deduplicated again
+    }
 
     // Helper to generate N Ball3D points
     auto makeBalls = [](int count) {
@@ -972,6 +1029,7 @@ GOLFSIM_TEST(SerialPort) {
     // Operations on unopened/failed port must fail gracefully without throwing or crashing
     TEST_ASSERT(!serial.writeChar('H'));
     TEST_ASSERT(!serial.writeString("TEST"));
+    TEST_ASSERT(serial.readAvailable().empty());
     serial.flush();
     serial.close();
 
@@ -1077,8 +1135,60 @@ GOLFSIM_TEST(AppConfig) {
     // Full round trip
     AppConfig again = AppConfig::fromJson(partial.toJson());
     TEST_ASSERT(again.camera.gain == 30 && again.detector.intensityThreshold == 90 && again.stereo.swapCameras);
+    TEST_ASSERT(again.strobe.pulseWidthUs == 30);
 
-    spdlog::info("[TEST] AppConfig load/merge/round-trip passed.");
+    // Strobe pulse width lives inside the eye-safety envelope whatever the file says.
+    {
+        StrobeConfig s;
+        TEST_ASSERT(s.pulseWidthUs == 30);
+        TEST_NEAR(s.dutyCycle(), 0.009, 1e-6);                               // 0.9% at 300 Hz
+        TEST_ASSERT(!s.clampToEnvelope());
+
+        StrobeConfig wide = StrobeConfig::fromJson({{"pulseWidthUs", 500}});
+        TEST_ASSERT(wide.pulseWidthUs == StrobeConfig::kMaxPulseWidthUs);   // 100 us
+        TEST_ASSERT(wide.dutyCycle() <= StrobeConfig::kMaxDutyCycle + 1e-9); // 3.0%
+
+        StrobeConfig tiny = StrobeConfig::fromJson({{"pulseWidthUs", 0}});
+        TEST_ASSERT(tiny.pulseWidthUs == StrobeConfig::kMinPulseWidthUs);
+
+        StrobeConfig sixty = StrobeConfig::fromJson({{"pulseWidthUs", 60}});
+        TEST_ASSERT(sixty.pulseWidthUs == 60 && sixty.toJson()["pulseWidthUs"] == 60);
+
+        // Bench limit is the firmware's optical rule (16.7% / 300 Hz / overdrive);
+        // blur is what the viewer prints next to a bench width.
+        TEST_ASSERT(StrobeConfig::benchPulseWidthLimitUs(1.0) == 556);
+        TEST_ASSERT(StrobeConfig::benchPulseWidthLimitUs(5.0) == 111);
+        TEST_NEAR(StrobeConfig::blurMmAt100mph(30), 1.34, 0.01);
+        TEST_NEAR(StrobeConfig::blurMmAt100mph(500), 22.4, 0.1);
+    }
+
+    // Project root lookup: the nearest ancestor holding config/golfsim.json
+    // wins, whichever directory the process was started from.
+    namespace fs = std::filesystem;
+    const fs::path fakeRoot = fs::path(TestSandbox::path("appconfig_root"));
+    const fs::path deep     = fakeRoot / "build" / "nested";
+    fs::create_directories(deep);
+    fs::create_directories(fakeRoot / "config");
+    { std::ofstream out(fakeRoot / AppConfig::kDefaultPath); out << "{}"; }
+    const std::string expectRoot = fs::absolute(fakeRoot).lexically_normal().string();
+    TEST_ASSERT(AppConfig::findProjectRootAbove(deep) == expectRoot);
+    TEST_ASSERT(AppConfig::findProjectRootAbove(fakeRoot) == expectRoot);
+    TEST_ASSERT(AppConfig::findProjectRootAbove(deep.string() + "/") == expectRoot);   // trailing separator
+    TEST_ASSERT(AppConfig::findProjectRootAbove(deep / ".." / "nested") == expectRoot); // unnormalised
+
+    // A tree without the marker never resolves to a directory inside itself
+    // (it may resolve to a real project root further up, or to nothing).
+    const fs::path bare = fs::path(TestSandbox::path("appconfig_bare")) / "a" / "b";
+    fs::create_directories(bare);
+    const std::string bareRoot = AppConfig::findProjectRootAbove(bare);
+    const std::string barePrefix = fs::absolute(fs::path(TestSandbox::path("appconfig_bare"))).lexically_normal().string();
+    TEST_ASSERT(bareRoot.empty() || bareRoot.rfind(barePrefix, 0) != 0);
+
+    // From this process the root, if found, really holds the config file.
+    const std::string liveRoot = AppConfig::findProjectRoot();
+    TEST_ASSERT(liveRoot.empty() || fs::is_regular_file(fs::path(liveRoot) / AppConfig::kDefaultPath));
+
+    spdlog::info("[TEST] AppConfig load/merge/round-trip and project root lookup passed.");
 }
 
 GOLFSIM_TEST(DotClusterFinder) {
